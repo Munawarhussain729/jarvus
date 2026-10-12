@@ -1,4 +1,4 @@
 #!/bin/bash
 cd /Users/mac/Projects/Jarvus
 source .venv/bin/activate
-python -m app.main_voice_full --local --fast --voice --wake-word "$@"
+python -m app.main_voice_full --voice --wake-word --fast "$@"
