@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from typing import Callable
+
 from app.audit.logger import AuditLogger, ToolAuditRecord
 from app.security.confirm import confirm_risky_action
 from app.security.policy import requires_user_confirmation
@@ -17,6 +19,9 @@ from app.tools.registry import ToolRegistry
 
 class ToolDispatchError(Exception):
     pass
+
+
+Confirmer = Callable[[str, str], bool]
 
 
 def _parse_arguments(raw: str) -> dict[str, Any]:
@@ -32,9 +37,20 @@ def _parse_arguments(raw: str) -> dict[str, Any]:
 class ToolRouter:
     """The only entry point from the assistant into tool execution."""
 
-    def __init__(self, registry: ToolRegistry, audit: AuditLogger) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        audit: AuditLogger,
+        confirmer: Confirmer | None = None,
+    ) -> None:
         self._registry = registry
         self._audit = audit
+        self._confirmer = confirmer or (
+            lambda tool_name, summary: confirm_risky_action(tool_name=tool_name, summary=summary)
+        )
+
+    def set_confirmer(self, confirmer: Confirmer) -> None:
+        self._confirmer = confirmer
 
     def handle_tool_call(self, *, tool_name: str, arguments_json: str) -> str:
         """
@@ -71,7 +87,7 @@ class ToolRouter:
 
         summary = f"{tool_name}({json.dumps(args, sort_keys=True)[:500]})"
         if requires_user_confirmation(tool.spec.risk):
-            approved = confirm_risky_action(tool_name=tool_name, summary=summary)
+            approved = self._confirmer(tool_name, summary)
             if not approved:
                 self._audit.log_tool_result(
                     ToolAuditRecord(

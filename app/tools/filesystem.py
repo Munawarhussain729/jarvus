@@ -11,6 +11,15 @@ from app.security.sanitize import InputRejected, sanitize_tool_argument_string
 from app.tools.base import Tool, ToolResult, ToolSpec
 
 
+def _allowed_roots() -> list[Path]:
+    roots = [Path.home().resolve(), Path("/tmp").resolve()]
+    extra = os.environ.get("JARVUS_FS_ROOTS", "")
+    for raw in extra.split(os.pathsep):
+        if raw.strip():
+            roots.append(Path(raw).expanduser().resolve())
+    return roots
+
+
 def _validate_path(p: str, *, field: str = "path") -> Path:
     try:
         # sanitize
@@ -18,14 +27,7 @@ def _validate_path(p: str, *, field: str = "path") -> Path:
     except InputRejected as e:
         raise ValueError(str(e)) from e
     path = Path(p).expanduser().resolve()
-    home = Path.home().resolve()
-    # Sandbox to home, projects, or /tmp - for local protection, restrict to user space
-    allowed_roots = [home, Path("/tmp"), Path("/Users/mac/Projects")]
-    # Check starts with any allowed root
-    ok = any(str(path).startswith(str(r)) for r in allowed_roots)
-    if not ok and path.is_relative_to(home):  # should be covered
-        ok = True
-    if not ok:
+    if not any(path == r or path.is_relative_to(r) for r in _allowed_roots()):
         raise ValueError(f"Path outside allowed sandbox: {path}")
     return path
 

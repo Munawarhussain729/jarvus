@@ -57,3 +57,17 @@ class EnhancedMemory(MemoryStore):
             except:
                 out.append((r["key"], r["value"]))
         return out
+
+    def delete_fact(self, key: str) -> bool:
+        cur = self._conn.execute("DELETE FROM facts WHERE key=?", (key,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def facts_prompt_block(self, max_facts: int = 50) -> str:
+        """Render stored facts as a system-prompt section."""
+        facts = self.list_facts()[:max_facts]
+        if not facts:
+            return ""
+        lines = ["KNOWN FACTS about the user (use them naturally):"]
+        lines += [f"- {k}: {v}" for k, v in facts]
+        return "\n".join(lines)

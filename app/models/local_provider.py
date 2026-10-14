@@ -1,21 +1,60 @@
-"""Local model provider - uses Ollama or llama.cpp HTTP if available."""
+"""Local model provider - Ollama native API with OpenAI-compatible fallback.
+
+Works against:
+- Ollama (native /api/chat): uses think=false, num_ctx, keep_alive. Recommended.
+- Any OpenAI-compatible endpoint (llama.cpp server, LM Studio, vLLM): /v1/chat/completions.
+"""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.models.base import AssistantTurn, ModelProvider, ToolCall
 
 
-class LocalProvider(ModelProvider):
-    def __init__(self, *, base_url: str = "http://localhost:11434/v1", model: str = "qwen3:4b", api_key: str = "ollama", temperature: float = 0.1, max_tokens: int = 256) -> None:
+def _json_or_original(value: Any) -> Any:
+    if isinstance(value, str):
         try:
-            from openai import OpenAI
-        except Exception:
-            raise RuntimeError("openai required for local provider via OpenAI-compatible API")
-        self._client = OpenAI(base_url=base_url, api_key=api_key)
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value if value is not None else {}
+
+
+class LocalProvider(ModelProvider):
+    def __init__(
+        self,
+        *,
+        base_url: str = "http://localhost:11434",
+        model: str = "qwen3:8b",
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+        num_ctx: int = 16384,
+        think: bool = False,
+        keep_alive: str = "30m",
+    ) -> None:
+        self._base = base_url.rstrip("/")
+        # Normalise: accept either the Ollama root or a /v1 compat URL
+        if self._base.endswith("/v1"):
+            self._base = self._base[: -len("/v1")]
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
+        self._num_ctx = num_ctx
+        self._think = think
+        self._keep_alive = keep_alive
+        self._ollama_native: bool | None = None  # detected lazily
+
+    def _detect_backend(self) -> bool:
+        if self._ollama_native is not None:
+            return self._ollama_native
+        try:
+            import httpx
+            r = httpx.get(f"{self._base}/api/version", timeout=2.0)
+            self._ollama_native = r.status_code == 200
+        except Exception:
+            self._ollama_native = False
+        return self._ollama_native
 
     def generate(
         self,
@@ -25,24 +64,88 @@ class LocalProvider(ModelProvider):
         tools: list[dict[str, Any]] | None,
     ) -> AssistantTurn:
         api_messages = [{"role": "system", "content": system_prompt}] + messages
-        kwargs = {
+        if self._detect_backend():
+            return self._generate_ollama(self._to_native_history(api_messages), tools)
+        return self._generate_openai_compat(api_messages, tools)
+
+    @staticmethod
+    def _to_native_history(api_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Ollama's native /api/chat expects tool_call function arguments as objects,
+        while our session stores them as JSON strings (OpenAI shape)."""
+        out: list[dict[str, Any]] = []
+        for msg in api_messages:
+            if msg.get("tool_calls"):
+                msg = dict(msg)
+                msg["tool_calls"] = [
+                    {
+                        **tc,
+                        "function": {
+                            **tc.get("function", {}),
+                            "arguments": _json_or_original(tc.get("function", {}).get("arguments")),
+                        },
+                    }
+                    for tc in msg["tool_calls"]
+                ]
+            out.append(msg)
+        return out
+
+    def _generate_ollama(self, api_messages: list[dict[str, Any]], tools) -> AssistantTurn:
+        import httpx
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": api_messages,
+            "stream": False,
+            "think": self._think,
+            "keep_alive": self._keep_alive,
+            "options": {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+                "num_ctx": self._num_ctx,
+                "top_p": 0.9,
+            },
+        }
+        if tools:
+            payload["tools"] = tools
+        try:
+            r = httpx.post(f"{self._base}/api/chat", json=payload, timeout=180.0)
+            r.raise_for_status()
+            msg = r.json().get("message", {})
+            tool_calls = []
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                args = fn.get("arguments")
+                if not isinstance(args, str):
+                    args = json.dumps(args or {})
+                tool_calls.append(ToolCall(
+                    id=tc.get("id") or f"call_{len(tool_calls)}",
+                    name=fn.get("name", ""),
+                    arguments_json=args,
+                ))
+            return AssistantTurn(content=msg.get("content"), tool_calls=tool_calls)
+        except Exception as e:
+            return AssistantTurn(content=f"[local model error] {e}", tool_calls=[])
+
+    def _generate_openai_compat(self, api_messages: list[dict[str, Any]], tools) -> AssistantTurn:
+        try:
+            from openai import OpenAI
+        except Exception:
+            return AssistantTurn(content="[local model error] openai package required for non-Ollama endpoints", tool_calls=[])
+        client = OpenAI(base_url=f"{self._base}/v1", api_key="local")
+        kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": api_messages,
             "temperature": self._temperature,
             "max_tokens": self._max_tokens,
-            "top_p": 0.9,
         }
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
         try:
-            resp = self._client.chat.completions.create(**kwargs)
-            choice = resp.choices[0]
-            msg = choice.message
+            resp = client.chat.completions.create(**kwargs)
+            msg = resp.choices[0].message
             tool_calls = []
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments_json=tc.function.arguments or "{}"))
+            for tc in msg.tool_calls or []:
+                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments_json=tc.function.arguments or "{}"))
             return AssistantTurn(content=msg.content, tool_calls=tool_calls)
         except Exception as e:
             return AssistantTurn(content=f"[local model error] {e}", tool_calls=[])

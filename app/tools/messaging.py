@@ -1,11 +1,11 @@
 """Messaging tool using macOS Messages app."""
 from __future__ import annotations
 
-import subprocess
 from typing import Any
 
 from app.security.policy import RiskLevel
 from app.security.sanitize import sanitize_tool_argument_string
+from app.tools.applescript import escape, run
 from app.tools.base import Tool, ToolResult, ToolSpec
 
 
@@ -27,8 +27,8 @@ class MessageTool(Tool):
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:
-            recipient = sanitize_tool_argument_string(arguments["recipient"], field_name="recipient")
-            text = sanitize_tool_argument_string(arguments["text"], field_name="text")
+            recipient = escape(sanitize_tool_argument_string(arguments["recipient"], field_name="recipient"))
+            text = escape(sanitize_tool_argument_string(arguments["text"], field_name="text"))
         except Exception as e:
             return ToolResult(ok=False, payload=str(e))
 
@@ -38,19 +38,8 @@ class MessageTool(Tool):
             set targetBuddy to participant "{recipient}" of targetService
             send "{text}" to targetBuddy
         end tell'''
-
-        try:
-            proc = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if proc.returncode == 0:
-                return ToolResult(ok=True, payload=f"Message sent to {recipient}")
-            return ToolResult(ok=False, payload=proc.stderr.strip() or "Failed to send message")
-        except Exception as e:
-            return ToolResult(ok=False, payload=str(e))
+        result = run(script, ok_payload=f"Message sent to {arguments['recipient']}")
+        return result
 
 
 class EmailTool(Tool):
@@ -72,9 +61,9 @@ class EmailTool(Tool):
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:
-            to_addr = sanitize_tool_argument_string(arguments["to"], field_name="to")
-            subject = sanitize_tool_argument_string(arguments["subject"], field_name="subject")
-            body = sanitize_tool_argument_string(arguments["body"], field_name="body")
+            to_addr = escape(sanitize_tool_argument_string(arguments["to"], field_name="to"))
+            subject = escape(sanitize_tool_argument_string(arguments["subject"], field_name="subject"))
+            body = escape(sanitize_tool_argument_string(arguments["body"], field_name="body"))
         except Exception as e:
             return ToolResult(ok=False, payload=str(e))
 
@@ -86,16 +75,4 @@ class EmailTool(Tool):
                 send
             end tell
         end tell'''
-
-        try:
-            proc = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if proc.returncode == 0:
-                return ToolResult(ok=True, payload=f"Email sent to {to_addr}")
-            return ToolResult(ok=False, payload=proc.stderr.strip() or "Failed to send email")
-        except Exception as e:
-            return ToolResult(ok=False, payload=str(e))
+        return run(script, ok_payload=f"Email sent to {arguments['to']}")

@@ -1,12 +1,26 @@
-"""Voice input listener with wake word and continuous mode - 100% local STT."""
+"""Voice input listener - continuous capture on one persistent mic stream.
+
+Runs 100% local STT. The capture loop never stops draining the audio buffer;
+while `paused` is set (i.e. during TTS playback) audio is discarded so Jarvus
+cannot hear and re-trigger itself. Commands are dispatched on a worker thread
+so the stream keeps draining during processing and playback.
+"""
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from typing import Callable, Optional
 
+import numpy as np
+
+from app.voice.stt import SAMPLE_RATE, SpeechToText, get_stt
+
 log = logging.getLogger("jarvus.voice.listener")
+
+DEFAULT_WAKE_WORDS = ["jarvis", "jarvus", "hey jarvis", "hey jarvus"]
+DEFAULT_STOP_PHRASES = ["go to sleep", "stop listening", "ok go to sleep"]
 
 try:
     import speech_recognition as sr
@@ -17,113 +31,158 @@ except ImportError:
 class VoiceListener:
     def __init__(
         self,
+        *,
+        stt: SpeechToText | None = None,
         wake_words: Optional[list[str]] = None,
+        stop_phrases: Optional[list[str]] = None,
         callback: Optional[Callable[[str], None]] = None,
         use_wake_word: bool = False,
+        stt_engine: str = "auto",
+        stt_model: str = "turbo",
     ):
-        self.wake_words = [w.lower() for w in (wake_words or ["jarvis", "jarvus", "hey jarvis", "hey jarvus"])]
+        self.wake_words = [w.lower() for w in (wake_words or DEFAULT_WAKE_WORDS)]
+        self.stop_phrases = [p.lower() for p in (stop_phrases or DEFAULT_STOP_PHRASES)]
         self.callback = callback
+        self.use_wake_word = use_wake_word
         self.listening = False
         self.should_stop = False
+        # When set, captured audio is drained and discarded (echo suppression).
+        self.paused = threading.Event()
+        # When set, the next transcribed phrase is a command even without a wake word
+        # (used after Jarvus answers a lone "Jarvis?" with "Yes?").
+        self.expect_command = threading.Event()
+
+        self._stt = stt  # lazily resolved via get_stt(engine, model)
+        self._stt_engine = stt_engine
+        self._stt_model = stt_model
+        self._one_shot: queue.Queue[str] | None = None
+        self._one_shot_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._worker: Optional[threading.Thread] = None
+
         self.recognizer = sr.Recognizer() if sr else None
-        self.microphone = sr.Microphone() if sr else None
-        self.use_wake_word = use_wake_word
-        self._model = None
+        self.microphone = sr.Microphone(sample_rate=SAMPLE_RATE) if sr else None
+        if self.recognizer:
+            self.recognizer.energy_threshold = 300
+            self.recognizer.pause_threshold = 0.7
+            self.recognizer.non_speaking_duration = 0.4
 
-    def _get_model(self):
-        if self._model is not None:
-            return self._model
-        from faster_whisper import WhisperModel
-        log.info("Loading whisper base model...")
-        self._model = WhisperModel("base", device="cpu", compute_type="int8")
-        log.info("Whisper model ready")
-        return self._model
+    def _engine(self) -> SpeechToText:
+        if self._stt is None:
+            self._stt = get_stt(self._stt_engine, self._stt_model)
+        return self._stt
 
-    def _adjust_for_noise(self):
-        if self.microphone and self.recognizer:
-            with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.3)
+    def _transcribe(self, audio) -> str:
+        raw = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
+        arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        return self._engine().transcribe(arr)
 
     def _contains_wake_word(self, text: str) -> bool:
-        text_low = text.lower()
-        return any(w in text_low for w in self.wake_words)
+        return any(w in text for w in self.wake_words)
 
     def _extract_command(self, text: str) -> str:
         text_low = text.lower()
-        for w in self.wake_words:
-            if w in text_low:
-                return text_low.replace(w, "").strip()
+        for w in sorted(self.wake_words, key=len, reverse=True):
+            idx = text_low.find(w)
+            if idx != -1:
+                return text[idx + len(w):].strip(" ,.!?")
         return text
 
-    def _transcribe(self, audio) -> str:
-        import numpy as np
-        raw_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
-        audio_array = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
-        model = self._get_model()
-        segments, _ = model.transcribe(audio_array, beam_size=1, vad_filter=True)
-        return " ".join(seg.text.strip() for seg in segments).strip()
-
-    def _listen_continuous(self):
-        log.info("Voice listener started (wake_word=%s, local STT)", self.use_wake_word)
-        if not self.recognizer or not self.microphone:
-            log.error("speech_recognition not available")
+    def _dispatch(self, text: str) -> None:
+        if self.callback is None:
             return
+        if self._worker and self._worker.is_alive():
+            log.debug("Busy - ignoring overlapping command")
+            return
+        self._worker = threading.Thread(target=self.callback, args=(text,), daemon=True)
+        self._worker.start()
 
-        self._adjust_for_noise()
+    def _listen_loop(self) -> None:
+        log.info("Voice listener started (wake_word=%s)", self.use_wake_word)
+        try:
+            self._engine()  # warm up STT before opening mic
+        except Exception as e:
+            log.error("STT unavailable: %s", e)
+            return
+        with self.microphone as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            while not self.should_stop:
+                try:
+                    audio = self.recognizer.listen(source, timeout=0.5, phrase_time_limit=10)
+                except sr.WaitTimeoutError:
+                    continue
+                except Exception as e:
+                    log.debug("capture error: %s", e)
+                    time.sleep(0.1)
+                    continue
 
-        while not self.should_stop:
-            try:
-                with self.microphone as source:
+                if self.paused.is_set():
+                    continue  # drain + discard: prevents TTS echo / buffer buildup
+
+                with self._one_shot_lock:
+                    one_shot = self._one_shot
+                if one_shot is not None:
                     try:
-                        audio = self.recognizer.listen(source, timeout=0.5, phrase_time_limit=6)
-                    except sr.WaitTimeoutError:
-                        continue
+                        one_shot.put(self._transcribe(audio))
+                    except Exception as e:
+                        log.debug("one-shot transcribe error: %s", e)
+                        one_shot.put("")
+                    continue
 
                 try:
                     text = self._transcribe(audio)
                 except Exception as e:
                     log.debug("Transcription error: %s", e)
                     continue
-
                 if not text:
                     continue
 
                 text_low = text.lower()
-                log.debug("Heard: %s", text)
+                log.info("Heard: %s", text)
 
-                if "ok go to sleep" in text_low or "go to sleep" in text_low or "stop listening" in text_low:
+                if any(sp in text_low for sp in self.stop_phrases):
                     log.info("Stop phrase detected")
                     self.stop()
                     break
 
                 if self.use_wake_word:
-                    if self._contains_wake_word(text_low):
-                        cmd = self._extract_command(text)
-                        if cmd and self.callback:
-                            self.callback(cmd)
+                    if self.expect_command.is_set():
+                        self.expect_command.clear()
+                        self._dispatch(text)
+                    elif self._contains_wake_word(text_low):
+                        self._dispatch(self._extract_command(text))
                 else:
-                    if self.callback:
-                        self.callback(text)
-
-            except Exception as e:
-                log.debug("Listen loop error: %s", e)
-                time.sleep(0.1)
-
+                    self._dispatch(text)
         self.listening = False
         log.info("Voice listener stopped")
 
-    def start(self):
+    def listen_once(self, timeout: float = 8.0) -> str:
+        """Capture one phrase and return its transcript (used for voice confirmations)."""
+        q: queue.Queue[str] = queue.Queue(maxsize=1)
+        with self._one_shot_lock:
+            self._one_shot = q
+        # Register before unpausing so the answer can't be dispatched as a command.
+        self.paused.clear()
+        try:
+            return q.get(timeout=timeout).strip()
+        except queue.Empty:
+            return ""
+        finally:
+            with self._one_shot_lock:
+                self._one_shot = None
+            self.paused.set()  # back to discarding until session resumes listening
+
+    def start(self) -> None:
         if self.listening:
             return
         if not self.recognizer or not self.microphone:
-            log.error("Cannot start listener: speech_recognition not available")
+            log.error("Cannot start listener: speech_recognition/pyaudio unavailable")
             return
         self.should_stop = False
-        self._thread = threading.Thread(target=self._listen_continuous, daemon=True)
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
         self.listening = True
 
-    def stop(self):
+    def stop(self) -> None:
         self.should_stop = True
         self.listening = False

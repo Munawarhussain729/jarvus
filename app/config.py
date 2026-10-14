@@ -29,6 +29,29 @@ class Settings(BaseSettings):
     temperature: float = Field(default=0.2)
     max_tokens: int = Field(default=512)  # smaller for speed
 
+    # Local LLM (Ollama native API preferred; any OpenAI-compatible base URL works)
+    llm_base_url: str = Field(default="http://localhost:11434")
+    llm_model: str = Field(default="qwen3:8b")
+    llm_num_ctx: int = Field(default=16384)
+    llm_think: bool = Field(default=False)  # qwen3-style thinking; off for voice latency
+
+    # Voice pipeline
+    stt_engine: str = Field(default="auto")  # auto | mlx | faster-whisper
+    stt_model: str = Field(default="turbo")  # turbo|small|medium|tiny|base|large or mlx repo id
+    tts_engine: str = Field(default="auto")  # auto | kokoro | say
+    tts_voice: str = Field(default="af_heart")  # kokoro voice id or macOS voice name
+    tts_rate: int = Field(default=200)  # 'say' words-per-minute
+    wake_words: str = Field(default="jarvis,jarvus,hey jarvis,hey jarvus")
+
+    # Remote access server (POST /chat)
+    server_host: str = Field(default="127.0.0.1")
+    server_port: int = Field(default=8765)
+    server_token: str | None = Field(default=None, repr=False)
+
+    @property
+    def wake_word_list(self) -> list[str]:
+        return [w.strip().lower() for w in self.wake_words.split(",") if w.strip()]
+
     @field_validator("data_dir", mode="before")
     @classmethod
     def expand_data_dir(cls, v: object) -> Path:

@@ -1,11 +1,11 @@
 """Music control tool using macOS AppleScript."""
 from __future__ import annotations
 
-import subprocess
 from typing import Any
 
 from app.security.policy import RiskLevel
 from app.security.sanitize import sanitize_tool_argument_string
+from app.tools.applescript import escape, run
 from app.tools.base import Tool, ToolResult, ToolSpec
 
 
@@ -53,13 +53,13 @@ class MusicTool(Tool):
             try:
                 vol = int(value) if value else 50
                 vol = max(0, min(100, vol))
-            except ValueError:
+            except (ValueError, TypeError):
                 return ToolResult(ok=False, payload="Volume must be 0-100")
             scripts["volume"] = f'set volume output volume {vol}'
 
         if action == "search_play":
             try:
-                query = sanitize_tool_argument_string(value, field_name="value")
+                query = escape(sanitize_tool_argument_string(str(value), field_name="value"))
             except Exception as e:
                 return ToolResult(ok=False, payload=str(e))
             scripts["search_play"] = f'''
@@ -77,16 +77,4 @@ class MusicTool(Tool):
         if action not in scripts:
             return ToolResult(ok=False, payload=f"Unknown action: {action}")
 
-        try:
-            proc = subprocess.run(
-                ["osascript", "-e", scripts[action]],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            output = proc.stdout.strip()
-            if proc.returncode == 0:
-                return ToolResult(ok=True, payload=output or f"Music {action} done")
-            return ToolResult(ok=False, payload=proc.stderr.strip() or "Music control failed")
-        except Exception as e:
-            return ToolResult(ok=False, payload=str(e))
+        return run(scripts[action], ok_payload=f"Music {action} done")

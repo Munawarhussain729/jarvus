@@ -1,5 +1,5 @@
-"""Jarvus Agent - Full capability CLI."""
-from app.main_full import main
+"""Backwards-compatible alias for the unified CLI (python -m app.main)."""
+from app.main import main
 
 if __name__ == "__main__":
     main()
