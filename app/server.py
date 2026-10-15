@@ -30,6 +30,10 @@ def _request_confirmer(tool_name: str, summary: str) -> bool:
 
 
 def make_handler(agent, token: str | None):
+    # The agent keeps one shared message history - serialize /chat calls so
+    # concurrent requests can't interleave turns and corrupt the context.
+    agent_lock = threading.Lock()
+
     class JarvusHandler(BaseHTTPRequestHandler):
         def _auth_ok(self) -> bool:
             if not token:
@@ -66,7 +70,8 @@ def make_handler(agent, token: str | None):
                 return self._send(400, {"error": "missing 'text'"})
             _confirm_ctx.allow = bool(body.get("confirm"))
             try:
-                reply = agent.process_user_text(text)
+                with agent_lock:
+                    reply = agent.process_user_text(text)
             except Exception as e:
                 log.exception("chat failed")
                 return self._send(500, {"error": str(e)})
@@ -104,10 +109,16 @@ class RemoteJarvus:
     def __init__(self, url: str, token: str | None = None) -> None:
         self._url = url.rstrip("/")
         self._token = token
+        self._client = None  # lazy httpx.Client - reuses keep-alive connection
+
+    def _http(self):
+        if self._client is None:
+            import httpx
+            headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
+            self._client = httpx.Client(base_url=self._url, headers=headers, timeout=300.0)
+        return self._client
 
     def process_user_text(self, text: str) -> str:
-        import httpx
-        headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
-        r = httpx.post(f"{self._url}/chat", json={"text": text}, headers=headers, timeout=300.0)
+        r = self._http().post("/chat", json={"text": text})
         r.raise_for_status()
         return str(r.json().get("reply", ""))

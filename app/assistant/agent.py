@@ -73,6 +73,24 @@ class JarvusAgent(AssistantSession):
         ):
             self._messages.pop(0)
 
+    _TOOL_BODY_KEEP_RECENT = 4  # most recent tool messages stay verbatim
+
+    def _compact_tool_history(self, before_idx: int) -> None:
+        """Elide bodies of old 'tool' role messages (keep the status prefix).
+
+        Old tool outputs are the biggest context growth driver - a web page or
+        dir listing fetched 10 turns ago still rides along in every prompt.
+        Only messages from previous turns (< before_idx) are touched; the
+        audit log keeps every output in full.
+        """
+        tool_idx = [i for i, m in enumerate(self._messages)
+                    if m.get("role") == "tool" and i < before_idx]
+        for i in tool_idx[:-self._TOOL_BODY_KEEP_RECENT]:
+            content = self._messages[i].get("content") or ""
+            if len(content) > 200:
+                prefix = content.split("]", 1)[0] + "]" if content.startswith("[tool") else ""
+                self._messages[i]["content"] = f"{prefix} (earlier output elided)".strip()
+
     def process_user_text(self, text: str) -> str:
         from app.security.sanitize import sanitize_user_message, InputRejected
 
@@ -101,6 +119,8 @@ class JarvusAgent(AssistantSession):
             return reply
 
         self._trim_context()
+        turn_start = len(self._messages)
+        self._compact_tool_history(turn_start)
         # Heuristic prefilter: shrink the schema payload for the small local
         # model. Union-matching + always-on core; expanded to the full set once
         # a tool round has run (results may need a tool outside the subset).
@@ -118,6 +138,7 @@ class JarvusAgent(AssistantSession):
             if rounds > 1 and subset_applied:
                 tools = self._registry.tools_payload_for(None)
                 subset_applied = False
+            self._compact_tool_history(turn_start)
             turn = self._provider.generate(
                 system_prompt=system_prompt,
                 messages=self._messages,

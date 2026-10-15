@@ -72,9 +72,15 @@ class VoiceListener:
             self._stt = get_stt(self._stt_engine, self._stt_model)
         return self._stt
 
+    # Below this RMS (float32 audio) a chunk is effectively silence - skip the
+    # whisper inference entirely instead of paying GPU time for a hallucination.
+    _SILENCE_RMS = 0.003
+
     def _transcribe(self, audio) -> str:
         raw = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
         arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if not arr.size or float(np.sqrt(np.mean(arr * arr))) < self._SILENCE_RMS:
+            return ""
         return self._engine().transcribe(arr)
 
     def _contains_wake_word(self, text: str) -> bool:

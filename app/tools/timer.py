@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from typing import Any
 
 from app.security.policy import RiskLevel
@@ -78,14 +79,17 @@ class AlarmTool(Tool):
         except ValueError:
             return ToolResult(ok=False, payload="Invalid time. Use HH:MM (00:00-23:59)")
 
+        # Sleep straight to the target instead of polling every 20s forever.
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        delay = (target - now).total_seconds()
+
         def _fire():
-            while True:
-                now = time.localtime()
-                if now.tm_hour == hour and now.tm_min == minute:
-                    msg = f"Alarm: {label}" if label else "Alarm"
-                    subprocess.run(["say", msg], capture_output=True, timeout=30)
-                    break
-                time.sleep(20)
+            time.sleep(delay)
+            msg = f"Alarm: {label}" if label else "Alarm"
+            subprocess.run(["say", msg], capture_output=True, timeout=30)
 
         t = threading.Thread(target=_fire, daemon=True)
         t.start()

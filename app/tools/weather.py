@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import urllib.request
 from typing import Any
 
 from app.security.policy import RiskLevel
@@ -39,13 +39,9 @@ class WeatherTool(Tool):
             else:
                 url = f"https://wttr.in/{city}?format=3"
 
-            proc = subprocess.run(
-                ["curl", "-s", "--max-time", "10", url],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            output = proc.stdout.strip()
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8 (weather)"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                output = resp.read().decode("utf-8", "replace").strip()
             if not output:
                 return ToolResult(ok=False, payload="No weather data received")
 
@@ -61,7 +57,7 @@ class WeatherTool(Tool):
                 output = f"Weather in {city_name}: {desc}, {temp_c}°C ({temp_f}°F), humidity {humidity}%, wind {wind} km/h"
 
             return ToolResult(ok=True, payload=output)
-        except subprocess.TimeoutExpired:
+        except TimeoutError:
             return ToolResult(ok=False, payload="Weather request timed out")
         except Exception as e:
             return ToolResult(ok=False, payload=str(e))

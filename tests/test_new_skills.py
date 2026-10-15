@@ -256,3 +256,63 @@ class TestNewIntents:
         s = tool_subset_for("lock the screen")
         assert "lock_screen" in s
         assert tool_subset_for("what's the meaning of life") is None
+
+
+class TestContextCompaction:
+    def test_stale_tool_bodies_elided(self, tmp_path):
+        from app.assistant.agent import JarvusAgent
+        from app.assistant.router import ToolRouter
+        from app.audit.logger import AuditLogger
+        from app.memory.enhanced import EnhancedMemory
+        from app.models.base import AssistantTurn, ModelProvider
+        from app.tools.registry import ToolRegistry
+
+        class _Fake(ModelProvider):
+            def generate(self, **kw):
+                return AssistantTurn(content="ok", tool_calls=[])
+
+        mem = EnhancedMemory(tmp_path / "x.db")
+        reg = ToolRegistry.default()
+        agent = JarvusAgent(provider=_Fake(), registry=reg,
+                            router=ToolRouter(reg, AuditLogger(mem)), memory=mem)
+        big = "[tool ok] " + "x" * 500
+        agent._messages = [
+            *[{"role": "tool", "tool_call_id": f"c{i}", "content": big} for i in range(6)],
+            {"role": "user", "content": "hi"},
+        ]
+        agent._compact_tool_history(len(agent._messages))
+        # 6 tool bodies, 4 most recent stay verbatim
+        assert "elided" in agent._messages[0]["content"]
+        assert agent._messages[0]["content"].startswith("[tool ok]")
+        assert "elided" in agent._messages[1]["content"]
+        assert agent._messages[2]["content"] == big
+        assert agent._messages[5]["content"] == big
+
+    def test_current_turn_never_elided(self, tmp_path):
+        from app.assistant.agent import JarvusAgent
+        from app.assistant.router import ToolRouter
+        from app.audit.logger import AuditLogger
+        from app.memory.enhanced import EnhancedMemory
+        from app.models.base import AssistantTurn, ModelProvider
+        from app.tools.registry import ToolRegistry
+
+        class _Fake(ModelProvider):
+            def generate(self, **kw):
+                return AssistantTurn(content="ok", tool_calls=[])
+
+        mem = EnhancedMemory(tmp_path / "x.db")
+        reg = ToolRegistry.default()
+        agent = JarvusAgent(provider=_Fake(), registry=reg,
+                            router=ToolRouter(reg, AuditLogger(mem)), memory=mem)
+        big = "[tool ok] " + "x" * 500
+        agent._messages = [{"role": "tool", "tool_call_id": f"c{i}", "content": big}
+                           for i in range(10)]
+        agent._compact_tool_history(before_idx=10)
+        assert all("elided" in m["content"] for m in agent._messages[:6])
+        # before_idx boundary: messages >= boundary belong to the live turn
+        agent._messages = [{"role": "tool", "tool_call_id": f"c{i}", "content": big}
+                           for i in range(10)]
+        agent._compact_tool_history(before_idx=5)
+        assert all("elided" in m["content"] for m in agent._messages[:1])
+        assert all(m["content"] == big for m in agent._messages[5:])
+        mem.close()
