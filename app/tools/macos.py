@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +14,25 @@ from app.tools.base import Tool, ToolResult, ToolSpec
 
 _APP_DIRS = ("/Applications", "/System/Applications", str(Path.home() / "Applications"))
 
+# App dir listing changes rarely; cache resolutions for 5 min to skip the
+# triple os.scandir on every 'open X'.
+_app_cache: dict[str, str | None] = {}
+_app_cache_at = 0.0
+_APP_CACHE_TTL = 300.0
+
 
 def _resolve_app(name: str) -> str | None:
     """Find the real app name (e.g. 'whats app' -> 'WhatsApp') in app dirs."""
+    global _app_cache_at
     base = name[:-4] if name.lower().endswith(".app") else name
     want = base.lower().replace(" ", "")
+    now = time.monotonic()
+    if now - _app_cache_at > _APP_CACHE_TTL:
+        _app_cache.clear()
+        _app_cache_at = now
+    if want in _app_cache:
+        return _app_cache[want]
+    found = None
     for d in _APP_DIRS:
         try:
             for entry in os.scandir(d):
@@ -25,10 +40,14 @@ def _resolve_app(name: str) -> str | None:
                     continue
                 stem = entry.name[:-4] if entry.name.lower().endswith(".app") else entry.name
                 if stem.lower().replace(" ", "") == want:
-                    return stem
+                    found = stem
+                    break
         except OSError:
             continue
-    return None
+        if found:
+            break
+    _app_cache[want] = found
+    return found
 
 
 class OpenAppTool(Tool):

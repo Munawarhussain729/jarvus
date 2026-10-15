@@ -34,10 +34,12 @@ def _is_hallucination(text: str) -> bool:
 HOTWORDS_PROMPT = (
     "Jarvus. Hey Jarvus. Open WhatsApp, Safari, Finder, Messages, Mail, Notes, "
     "Calendar, Music, Spotify, Slack, Terminal, Microsoft Word, Excel, Telegram, "
-    "Chrome. Read my notifications, set a timer, weather, reminder, alarm, "
+    "Chrome. Read my notifications, set a timer, weather forecast, reminder, alarm, "
     "volume, brightness, mute, screenshot, clipboard, play music, pause, "
-    "next track, send a message, email, notes, web search, list files, "
-    "read file, run command, system info, battery."
+    "next track, send a message, email, notes, web search, Wikipedia, find files, "
+    "read file, run command, system info, battery, dark mode, lock screen, "
+    "Bitcoin price, stock price, currency, convert miles to kilometers, "
+    "calculate, news, headlines, password, coin flip, what's my IP address."
 )
 
 # Friendly names -> mlx-community HF repo
