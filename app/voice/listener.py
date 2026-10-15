@@ -107,8 +107,14 @@ class VoiceListener:
         with self.microphone as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
             while not self.should_stop:
+                # Short phrase chunks while paused (TTS drain) or awaiting a
+                # one-shot answer: shrinks the dead window so a quick 'yes'
+                # said right after the prompt isn't eaten by a stale capture.
+                with self._one_shot_lock:
+                    one_shot_pending = self._one_shot is not None
+                ptl = 4 if one_shot_pending else (1.5 if self.paused.is_set() else 10)
                 try:
-                    audio = self.recognizer.listen(source, timeout=0.5, phrase_time_limit=10)
+                    audio = self.recognizer.listen(source, timeout=0.5, phrase_time_limit=ptl)
                 except sr.WaitTimeoutError:
                     continue
                 except Exception as e:
@@ -161,6 +167,10 @@ class VoiceListener:
         q: queue.Queue[str] = queue.Queue(maxsize=1)
         with self._one_shot_lock:
             self._one_shot = q
+        # Loud TTS playback inflates the adaptive energy threshold - cap it so
+        # a normal-volume 'yes' right after the prompt isn't filtered out.
+        old_threshold = self.recognizer.energy_threshold
+        self.recognizer.energy_threshold = min(old_threshold, 200)
         # Register before unpausing so the answer can't be dispatched as a command.
         self.paused.clear()
         try:
@@ -170,6 +180,7 @@ class VoiceListener:
         finally:
             with self._one_shot_lock:
                 self._one_shot = None
+            self.recognizer.energy_threshold = old_threshold
             self.paused.set()  # back to discarding until session resumes listening
 
     def start(self) -> None:

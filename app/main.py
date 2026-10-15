@@ -27,8 +27,13 @@ def _setup_logging(level: str) -> None:
     )
 
 
-def _text_repl(agent) -> None:
+def _text_repl(agent, memory=None, *, auto_brief: bool = False) -> None:
     print("\nJarvus ready. Type 'exit' to quit.\n")
+    if auto_brief:
+        from app.tools.briefing import maybe_auto_brief
+        digest = maybe_auto_brief(memory, enabled=True)
+        if digest:
+            print(f"Jarvus> {digest}\n")
     while True:
         try:
             line = input("You> ").strip()
@@ -45,7 +50,7 @@ def _text_repl(agent) -> None:
             print(f"[error] {e}", file=sys.stderr)
 
 
-def _run_voice(settings, agent, *, wake_word: bool, speak: bool) -> None:
+def _run_voice(settings, agent, *, wake_word: bool, speak: bool, auto_brief: bool = False) -> None:
     from app.voice.listener import VoiceListener
     from app.voice.session import JarvusVoice
     from app.voice.tts import get_tts
@@ -57,7 +62,7 @@ def _run_voice(settings, agent, *, wake_word: bool, speak: bool) -> None:
         stt_engine=settings.stt_engine,
         stt_model=settings.stt_model,
     )
-    voice = JarvusVoice(agent, listener=listener, tts=tts, always_speak=speak)
+    voice = JarvusVoice(agent, listener=listener, tts=tts, always_speak=speak, auto_brief=auto_brief)
     # Route HIGH-risk confirmations through voice instead of stdin (local runs only).
     router = getattr(agent, "_router", None)
     if router is not None:
@@ -117,11 +122,15 @@ def main() -> None:
         print(f"Model: {args.model or (settings.model if args.openai else settings.llm_model)}"
               f"{' (openai)' if args.openai else ' (local)'} | DB: {settings.resolved_db_path()}")
 
+    auto_brief = settings.auto_brief.lower() == "on" or (
+        settings.auto_brief.lower() == "auto" and args.voice
+    )
     try:
         if args.voice:
-            _run_voice(settings, agent, wake_word=args.wake_word, speak=not args.no_speak)
+            _run_voice(settings, agent, wake_word=args.wake_word, speak=not args.no_speak,
+                       auto_brief=auto_brief)
         else:
-            _text_repl(agent)
+            _text_repl(agent, memory, auto_brief=auto_brief)
     finally:
         if memory is not None:
             memory.close()

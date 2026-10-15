@@ -45,6 +45,21 @@ def match(text: str) -> Optional[tuple[str, str]]:
     if re.search(r"\b(?:read|check|show|see)\s+(?:my\s+)?notifications\b", t):
         return "read_notifications", "{}"
 
+    # Daily digest / task analysis - deterministic, no LLM round trip.
+    if re.search(r"\b(?:brief|briefing|analy[sz]e|review|plan)\b.*\b(?:my\s+)?(?:day|tasks?|schedule)\b", t) or \
+       re.search(r"\b(?:what'?s on|what do i have|my)\s+(?:today|schedule|agenda|day)\b", t) or \
+       re.search(r"\bhow'?s my day\b", t):
+        return "daily_brief", "{}"
+
+    if re.search(r"\b(?:list|show|read|check|what are)\s+(?:my\s+)?reminders\b", t):
+        return "list_reminders", "{}"
+
+    if re.search(r"\b(?:what'?s on|show|list|read|check)\s+(?:my\s+)?calendar\b", t):
+        return "calendar_read", "{}"
+
+    if re.search(r"\b(?:show|list|what are|check)\s+(?:my\s+)?(?:to-?dos?|tasks?)\b|\btask list\b", t):
+        return "todo_write", json.dumps({"action": "list"})
+
     if re.search(r"\b(?:battery|charge level|power left|charging|percentage left|how much (?:charge|power))\b", t):
         return "battery", "{}"
 
@@ -81,3 +96,61 @@ def match(text: str) -> Optional[tuple[str, str]]:
         return "open_app", json.dumps({"app_name": m.group(1).strip()})
 
     return None
+
+
+# ---- Heuristic tool prefilter (JARVUS_TOOL_PREFILTER=off to disable) ----
+# Shrinks the schema payload the small local model has to reason over.
+# CONSERVATIVE BY DESIGN: a false negative (dropping the needed tool) is
+# unrecoverable - the model can never select it. So: union of ALL matching
+# groups, a broad always-on core, and callers expand to the full set once a
+# tool round has run (a tool result may need a tool outside the subset).
+
+_ALWAYS_TOOLS = frozenset({
+    "remember", "recall", "forget", "scratchpad", "plan", "todo_write",
+    "daily_brief", "clock", "echo", "say",
+})
+
+_TOOL_GROUPS: list[tuple[re.Pattern, frozenset[str]]] = [
+    (re.compile(r"\bfiles?\b|\bfolders?\b|\bdirector(?:y|ies)\b|\bdocuments?\b|\.(?:txt|md|py|csv|json|docx)\b"),
+     {"read_file", "write_file", "list_dir", "glob_files", "create_docx"}),
+    (re.compile(r"\b(?:terminal|shell|command|cmd|script|execut|python|code|process(?:es)?|kill|compile|build)\b"),
+     {"run_command", "shell_read", "python_exec", "safe_shell", "ps_list"}),
+    (re.compile(r"\b(?:app|application|open|launch|quit|close|front|active window)\b"),
+     {"open_app", "frontmost_app"}),
+    (re.compile(r"\bnotifications?\b|\bbanner\b"),
+     {"send_notification", "read_notifications"}),
+    (re.compile(r"\b(?:screenshots?|screen|clipboard|copy|paste)\b"),
+     {"screenshot", "clipboard", "frontmost_app"}),
+    (re.compile(r"\b(?:volume|mute|unmute|louder|quieter|sound)\b"),
+     {"volume"}),
+    (re.compile(r"\b(?:reminders?|remind|calendar|events?|meetings?|appointments?|schedule|agenda|"
+                r"tasks?|to-?dos?|brief(?:ing)?|timer|alarm|wake me)\b"),
+     {"reminder", "calendar", "list_reminders", "calendar_read", "timer", "alarm", "daily_brief"}),
+    (re.compile(r"\b(?:music|songs?|tracks?|play|pause|skip|spotify|playlist|playing)\b"),
+     {"music", "volume"}),
+    (re.compile(r"\b(?:messages?|texts?|whatsapp|imessage|sms|email|e-mail|mail)\b"),
+     {"message", "email"}),
+    (re.compile(r"\b(?:search|google|look ?up|web|online|internet|fetch|url|website|browse|link)\b"),
+     {"web_search", "web_fetch"}),
+    (re.compile(r"\b(?:weather|forecast|temperature|rain|sunny|cloudy)\b"),
+     {"weather"}),
+    (re.compile(r"\b(?:system|battery|charging|charge|cpu|ram|disk|uptime|specs|memory usage)\b"),
+     {"system_info", "ps_list", "battery"}),
+    (re.compile(r"\b(?:word|docx|essay|report)\b"),
+     {"create_docx", "write_file"}),
+]
+
+
+def tool_subset_for(text: str) -> frozenset[str] | None:
+    """Tool names the user text plausibly needs, or None for the full payload.
+
+    Union of every matching group plus the always-on core - never first-match.
+    """
+    t = text.lower()
+    names = set(_ALWAYS_TOOLS)
+    matched = False
+    for pattern, tools in _TOOL_GROUPS:
+        if pattern.search(t):
+            matched = True
+            names.update(tools)
+    return frozenset(names) if matched else None

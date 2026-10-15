@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     tts_rate: int = Field(default=200)  # 'say' words-per-minute
     wake_words: str = Field(default="jarvis,jarvus,hey jarvis,hey jarvus")
 
+    # Daily briefing: auto = voice sessions only, on = text too, off = never
+    auto_brief: str = Field(default="auto")
+    # Heuristic tool-payload prefilter (off = always send all schemas)
+    tool_prefilter: bool = Field(default=True)
+
     # Remote access server (POST /chat)
     server_host: str = Field(default="127.0.0.1")
     server_port: int = Field(default=8765)

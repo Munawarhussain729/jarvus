@@ -91,6 +91,128 @@ def _opt(arguments: dict[str, Any], key: str, default: str) -> str:
     return escape(sanitize_tool_argument_string(raw, field_name=key))
 
 
+def day_bounds(day: str = "today", days: int = 1) -> tuple[datetime, datetime] | None:
+    """Local (start, end) datetimes covering `days` days starting on `day`
+    ('today', 'tomorrow', 'week', weekday names, ISO/US dates)."""
+    day = (day or "today").strip().lower()
+    if day in ("week", "this week"):
+        day, days = "today", max(days, 7)
+    d = _parse_due(day)
+    if d is None:
+        return None
+    start = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=max(1, int(days)))
+
+
+def _fmt_date(var: str) -> str:
+    """AppleScript expr rendering date var as 'YYYY-MM-DD H:MM' (parseable by strptime)."""
+    return (f'((year of {var} as integer) & "-" & (month of {var} as integer) & "-" '
+            f'& (day of {var}) & " " & ((time of {var}) div 3600) & ":" '
+            f'& (((time of {var}) mod 3600) div 60))')
+
+
+_PERMISSION_MSG = (
+    "macOS denied access - grant the terminal app Reminders/Calendar "
+    "permission in System Settings > Privacy & Security, then retry."
+)
+
+
+def _check_perm(res: ToolResult) -> str | None:
+    """Return a friendly message when osascript reported an Automation denial."""
+    if res.ok:
+        return None
+    if "1743" in res.payload or "not authorized" in res.payload.lower():
+        return _PERMISSION_MSG
+    return res.payload
+
+
+def _parse_row_dt(raw: str) -> datetime | None:
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_open_reminders(limit: int = 200) -> tuple[list[dict[str, Any]], str]:
+    """(rows, error). rows: {'text','list','due': datetime|None}. Shared by the
+    list_reminders tool and the daily digest - mock this in tests."""
+    script = f'''
+    tell application "Reminders"
+        set out to ""
+        repeat with l in lists
+            set ln to name of l
+            repeat with r in (get reminders of l whose completed is false)
+                set nm to ""
+                try
+                    set nm to name of r
+                end try
+                if nm is not "" then
+                    set dd to ""
+                    try
+                        set d to due date of r
+                        set dd to {_fmt_date("d")}
+                    end try
+                    set out to out & nm & "|" & ln & "|" & dd & linefeed
+                end if
+            end repeat
+        end repeat
+        return out
+    end tell'''
+    res = run(script, timeout=30)
+    err = _check_perm(res)
+    if err:
+        return [], err
+    rows = []
+    for line in res.payload.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 3 and parts[0]:
+            rows.append({"text": parts[0], "list": parts[1], "due": _parse_row_dt(parts[2])})
+        if len(rows) >= limit:
+            break
+    return rows, ""
+
+
+def fetch_calendar_events(start: datetime, end: datetime, limit: int = 50) -> tuple[list[dict[str, Any]], str]:
+    """(rows, error). rows: {'title','calendar','start','end','all_day'}."""
+    script = f'''
+    {_as_date("sd", start)}
+    {_as_date("ed", end)}
+    tell application "Calendar"
+        set out to ""
+        repeat with c in calendars
+            set cn to name of c
+            repeat with e in (get every event of c whose start date ≥ sd and start date < ed)
+                try
+                    set sm to summary of e
+                    set es to start date of e
+                    set ee to end date of e
+                    set allday to allday event of e
+                    if sm is not "" then
+                        set out to out & sm & "|" & cn & "|" & {_fmt_date("es")} & "|" & {_fmt_date("ee")} & "|" & allday & linefeed
+                    end if
+                end try
+            end repeat
+        end repeat
+        return out
+    end tell'''
+    res = run(script, timeout=45)
+    err = _check_perm(res)
+    if err:
+        return [], err
+    rows = []
+    for line in res.payload.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 4 and parts[0]:
+            rows.append({
+                "title": parts[0], "calendar": parts[1],
+                "start": _parse_row_dt(parts[2]), "end": _parse_row_dt(parts[3]),
+                "all_day": len(parts) > 4 and parts[4].lower() == "true",
+            })
+        if len(rows) >= limit:
+            break
+    return rows, ""
+
+
 class ReminderTool(Tool):
     spec = ToolSpec(
         name="reminder",
@@ -197,3 +319,86 @@ class CalendarTool(Tool):
             end tell
         end tell'''
         return run(script, ok_payload=f"Calendar event added: {arguments['title']}")
+
+
+def _fmt_due(d: datetime | None) -> str:
+    if d is None:
+        return ""
+    today = datetime.now().date()
+    if d.date() == today:
+        return f"today {d.strftime('%H:%M')}"
+    if d.date() < today:
+        return f"OVERDUE {d.strftime('%Y-%m-%d %H:%M')}"
+    return d.strftime("%Y-%m-%d %H:%M")
+
+
+class ListRemindersTool(Tool):
+    spec = ToolSpec(
+        name="list_reminders",
+        description="List incomplete macOS Reminders, with due times. Filter: all, today, or overdue.",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "when": {"type": "string", "enum": ["all", "today", "overdue"], "default": "all"},
+                "list": {"type": "string", "description": "Reminder list name filter (optional)"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            },
+            "additionalProperties": False,
+        },
+        risk=RiskLevel.LOW,
+    )
+
+    def run(self, arguments: dict[str, Any]) -> ToolResult:
+        when = str(arguments.get("when") or "all")
+        list_filter = str(arguments.get("list") or "").strip().lower()
+        limit = min(50, max(1, int(arguments.get("limit") or 20)))
+        rows, err = fetch_open_reminders()
+        if err:
+            return ToolResult(ok=False, payload=err)
+        today = datetime.now().date()
+        if when == "today":
+            rows = [r for r in rows if r["due"] and r["due"].date() <= today]
+        elif when == "overdue":
+            rows = [r for r in rows if r["due"] and r["due"].date() < today]
+        if list_filter:
+            rows = [r for r in rows if list_filter in r["list"].lower()]
+        rows.sort(key=lambda r: (r["due"] is None, r["due"] or datetime.max))
+        rows = rows[:limit]
+        if not rows:
+            return ToolResult(ok=True, payload=f"No {when} reminders found.")
+        lines = [f"- {r['text']}" + (f" [{_fmt_due(r['due'])}]" if r["due"] else "")
+                 + (f" ({r['list']})" if r["list"] else "") for r in rows]
+        return ToolResult(ok=True, payload="\n".join(lines))
+
+
+class CalendarReadTool(Tool):
+    spec = ToolSpec(
+        name="calendar_read",
+        description="List macOS Calendar events for a day/range (today, tomorrow, week, a date).",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "day": {"type": "string", "description": "today | tomorrow | week | a date like '2026-10-20'"},
+                "days": {"type": "integer", "minimum": 1, "maximum": 14, "default": 1},
+            },
+            "additionalProperties": False,
+        },
+        risk=RiskLevel.LOW,
+    )
+
+    def run(self, arguments: dict[str, Any]) -> ToolResult:
+        day = str(arguments.get("day") or "today")
+        days = int(arguments.get("days") or 1)
+        bounds = day_bounds(day, days)
+        if not bounds:
+            return ToolResult(ok=False, payload=f"could not parse day '{day}'")
+        rows, err = fetch_calendar_events(*bounds)
+        if err:
+            return ToolResult(ok=False, payload=err)
+        if not rows:
+            return ToolResult(ok=True, payload=f"No events for {day}.")
+        lines = []
+        for r in rows:
+            when = "all day" if r["all_day"] or not r["start"] else r["start"].strftime("%H:%M")
+            lines.append(f"- [{when}] {r['title']}" + (f" ({r['calendar']})" if r["calendar"] else ""))
+        return ToolResult(ok=True, payload="\n".join(lines))

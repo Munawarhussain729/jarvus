@@ -20,6 +20,20 @@ class ToolRegistry:
             if name in self._tools:
                 raise ValueError(f"Duplicate tool name: {name}")
             self._tools[name] = t
+        self._tools_payload = self._build_payload()
+
+    def _build_payload(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.parameters_schema,
+                },
+            }
+            for spec in (t.spec for t in self._tools.values())
+        ]
 
     @classmethod
     def default(cls) -> ToolRegistry:
@@ -34,20 +48,15 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def openai_tools_payload(self) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for tool in self._tools.values():
-            spec = tool.spec
-            out.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": spec.name,
-                        "description": spec.description,
-                        "parameters": spec.parameters_schema,
-                    },
-                }
-            )
-        return out
+        # Cached at construction (registry is static). Callers must not mutate
+        # the returned dicts - build a fresh list to subset.
+        return list(self._tools_payload)
+
+    def tools_payload_for(self, names: set[str] | None) -> list[dict[str, Any]]:
+        """Subset of the cached payload (fresh list) or the full payload."""
+        if not names:
+            return list(self._tools_payload)
+        return [t for t in self._tools_payload if t["function"]["name"] in names]
 
 
 class EchoTool(Tool):

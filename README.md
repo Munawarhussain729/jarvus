@@ -25,10 +25,12 @@ reply ──> clean_for_speech ──> TTS (Kokoro/say) ──> speaker
 ```
 
 - The model only proposes structured `tool_calls`; the router validates, applies risk policy, asks for confirmation on HIGH-risk tools (typed `yes` in text mode, spoken `yes` in voice mode), executes, and writes an audit row.
-- A deterministic fast path (`app/assistant/intents.py`) answers the most common commands — timers, clock, notifications, screenshot, music, volume, weather, open-app — without an LLM round-trip. Everything else goes to the model; if the model promises an action without calling a tool, the agent nudges it once to actually call it.
+- A deterministic fast path (`app/assistant/intents.py`) answers the most common commands — timers, clock, notifications, screenshot, music, volume, weather, open-app, **daily brief** — without an LLM round-trip. Everything else goes to the model; if the model promises an action without calling a tool, the agent nudges it once to actually call it.
+- A conservative keyword prefilter (`JARVUS_TOOL_PREFILTER`) shrinks the ~40 tool schemas sent to the local model; turns expand to the full set after the first tool round so nothing is ever unrecoverable.
+- **Daily tasks**: `list_reminders` / `calendar_read` read macOS Reminders & Calendar; `daily_brief` merges them with the persisted todo list (`todo_write`) and latest notes into one spoken digest. Say "brief me on my day", or let the morning auto-brief speak it on the first session of the day (`JARVUS_AUTO_BRIEF=auto|on|off`).
 - While Jarvus speaks, the mic loop drains and discards audio — it can't hear itself.
-- Long-term facts (`remember`/`recall`/`forget` tools) persist in SQLite and are injected into the system prompt.
-- `read_notifications` needs Full Disk Access granted to your terminal app (System Settings → Privacy & Security → Full Disk Access), then restart Jarvus.
+- Long-term facts (`remember`/`recall`/`forget` tools) persist in SQLite and are injected into the system prompt. Todos and plans persist too; internal state (e.g. last brief date) lives in a separate `meta` table that never reaches the prompt.
+- `read_notifications` needs Full Disk Access granted to your terminal app (System Settings → Privacy & Security → Full Disk Access), then restart Jarvus. `list_reminders`/`calendar_read`/`daily_brief` trigger a one-time macOS Automation permission prompt on first use.
 
 ## Setup (macOS)
 
@@ -69,7 +71,7 @@ python -m app.main --voice --remote-url http://server:8765   # Mac client
 
 ## Config
 
-Everything is env-driven (`JARVUS_*`, see `.env.example`): LLM URL/model/ctx/think, STT engine+model, TTS engine+voice, wake words, server host/port/token, `JARVUS_FS_ROOTS` for extra file-sandbox roots.
+Everything is env-driven (`JARVUS_*`, see `.env.example`): LLM URL/model/ctx/think, STT engine+model, TTS engine+voice, wake words, server host/port/token, `JARVUS_FS_ROOTS` for extra file-sandbox roots, `JARVUS_AUTO_BRIEF` for the morning digest, `JARVUS_TOOL_PREFILTER` for the schema prefilter.
 
 ## Security model
 

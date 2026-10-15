@@ -44,13 +44,20 @@ class LocalProvider(ModelProvider):
         self._think = think
         self._keep_alive = keep_alive
         self._ollama_native: bool | None = None  # detected lazily
+        self._http = None  # lazily-shared httpx.Client (keep-alive pooling)
+        self._oai = None  # lazily-shared OpenAI compat client
+
+    def _client(self):
+        if self._http is None:
+            import httpx
+            self._http = httpx.Client(timeout=180.0)
+        return self._http
 
     def _detect_backend(self) -> bool:
         if self._ollama_native is not None:
             return self._ollama_native
         try:
-            import httpx
-            r = httpx.get(f"{self._base}/api/version", timeout=2.0)
+            r = self._client().get(f"{self._base}/api/version", timeout=2.0)
             self._ollama_native = r.status_code == 200
         except Exception:
             self._ollama_native = False
@@ -90,7 +97,6 @@ class LocalProvider(ModelProvider):
         return out
 
     def _generate_ollama(self, api_messages: list[dict[str, Any]], tools) -> AssistantTurn:
-        import httpx
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": api_messages,
@@ -107,7 +113,7 @@ class LocalProvider(ModelProvider):
         if tools:
             payload["tools"] = tools
         try:
-            r = httpx.post(f"{self._base}/api/chat", json=payload, timeout=180.0)
+            r = self._client().post(f"{self._base}/api/chat", json=payload)
             r.raise_for_status()
             msg = r.json().get("message", {})
             tool_calls = []
@@ -130,7 +136,9 @@ class LocalProvider(ModelProvider):
             from openai import OpenAI
         except Exception:
             return AssistantTurn(content="[local model error] openai package required for non-Ollama endpoints", tool_calls=[])
-        client = OpenAI(base_url=f"{self._base}/v1", api_key="local")
+        if self._oai is None:
+            self._oai = OpenAI(base_url=f"{self._base}/v1", api_key="local")
+        client = self._oai
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": api_messages,

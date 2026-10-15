@@ -21,9 +21,10 @@ from app.tools.messaging import EmailTool, MessageTool
 from app.tools.music import MusicTool
 from app.tools.notes import NoteTool
 from app.tools.notifications import NotificationsTool
+from app.tools.briefing import DailyBriefTool
 from app.tools.plan import PlanTool, TodoWriteTool
 from app.tools.registry import EchoTool, ToolRegistry
-from app.tools.reminders import CalendarTool, ReminderTool
+from app.tools.reminders import CalendarReadTool, CalendarTool, ListRemindersTool, ReminderTool
 from app.tools.safe_shell import SafeShellTool
 from app.tools.search import WebSearchTool
 from app.tools.shell_extended import ShellReadOnlyTool
@@ -46,8 +47,8 @@ def build_registry(memory: EnhancedMemory) -> ToolRegistry:
         SystemInfoTool(),
         PsTool(),
         ClockTool(),
-        PlanTool(),
-        TodoWriteTool(),
+        PlanTool(memory),
+        TodoWriteTool(memory),
         PythonExecTool(),
         RunCommandTool(),
         OpenAppTool(),
@@ -58,6 +59,9 @@ def build_registry(memory: EnhancedMemory) -> ToolRegistry:
         AlarmTool(),
         ReminderTool(),
         CalendarTool(),
+        ListRemindersTool(),
+        CalendarReadTool(),
+        DailyBriefTool(memory),
         MusicTool(),
         MessageTool(),
         EmailTool(),
@@ -110,5 +114,6 @@ def build_agent(
     audit = AuditLogger(memory)
     router = ToolRouter(registry, audit, confirmer=confirmer)
     provider = build_provider(settings, use_openai=use_openai, model=model, base_url=base_url)
-    agent = JarvusAgent(provider=provider, registry=registry, router=router, memory=memory)
+    agent = JarvusAgent(provider=provider, registry=registry, router=router, memory=memory,
+                        tool_prefilter=settings.tool_prefilter)
     return agent, memory

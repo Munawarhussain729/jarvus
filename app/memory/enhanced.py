@@ -27,6 +27,17 @@ class EnhancedMemory(MemoryStore):
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         self._conn.commit()
@@ -71,3 +82,64 @@ class EnhancedMemory(MemoryStore):
         lines = ["KNOWN FACTS about the user (use them naturally):"]
         lines += [f"- {k}: {v}" for k, v in facts]
         return "\n".join(lines)
+
+    # ---- Internal meta key/value (never injected into the prompt) ----
+
+    def get_meta(self, key: str) -> str | None:
+        cur = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,))
+        r = cur.fetchone()
+        return r["value"] if r else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        self._conn.commit()
+
+    # ---- Persistent todo list ----
+
+    def set_todos(self, todos: list[dict[str, Any]]) -> None:
+        """Replace the whole list (mirrors the model's whole-array semantics)."""
+        now = _utc_now_iso()
+        self._conn.execute("DELETE FROM todos")
+        self._conn.executemany(
+            "INSERT INTO todos(content,status,priority,updated_at) VALUES (?,?,?,?)",
+            [(str(t["content"]), str(t["status"]), str(t["priority"]), now) for t in todos],
+        )
+        self._conn.commit()
+
+    def add_todo(self, content: str, status: str = "pending", priority: str = "medium") -> None:
+        self._conn.execute(
+            "INSERT INTO todos(content,status,priority,updated_at) VALUES (?,?,?,?)",
+            (content, status, priority, _utc_now_iso()),
+        )
+        self._conn.commit()
+
+    def complete_todo(self, content_contains: str) -> int:
+        """Mark matching pending/in_progress todos completed. Returns rows touched."""
+        cur = self._conn.execute(
+            "UPDATE todos SET status='completed', updated_at=? "
+            "WHERE status IN ('pending','in_progress') AND lower(content) LIKE ?",
+            (_utc_now_iso(), f"%{content_contains.lower()}%"),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def list_todos(self, include_done: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT content,status,priority FROM todos"
+        if not include_done:
+            q += " WHERE status != 'completed'"
+        q += " ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, id"
+        cur = self._conn.execute(q)
+        return [dict(r) for r in cur.fetchall()]
+
+    # ---- Persistent plans ----
+
+    def save_plan(self, name: str, content: str, status: str = "active") -> None:
+        now = _utc_now_iso()
+        self._conn.execute(
+            "INSERT INTO plans(name,content,status,created_at,updated_at) VALUES (?,?,?,?,?)",
+            (name, content, status, now, now),
+        )
+        self._conn.commit()

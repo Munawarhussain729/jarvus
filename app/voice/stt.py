@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import re
 import threading
 from typing import Protocol
 
@@ -12,12 +13,31 @@ log = logging.getLogger("jarvus.voice.stt")
 
 SAMPLE_RATE = 16000
 
+# Whisper's classic hallucinations on silence/ambient noise - phrases that are
+# never real commands. NOTE: yes/no/okay/yeah are excluded on purpose - they
+# are valid answers to voice confirmations.
+_HALLUCINATIONS = {
+    "thank you", "thanks", "thanks for watching", "thank you for watching",
+    "thanks for listening", "thank you for listening", "bye", "goodbye",
+    "see you", "see you next time", "all right", "alright", "hmm", "mhm",
+    "um", "uh", "so", "you", "like and subscribe", "subscribe",
+    "subtitles by", "amaraorg", "please subscribe", "copyright",
+}
+
+
+def _is_hallucination(text: str) -> bool:
+    t = re.sub(r"[^a-z ]", "", text.lower()).strip()
+    return not t or t in _HALLUCINATIONS
+
+
 # Bias whisper toward the assistant's vocabulary so commands land correctly.
 HOTWORDS_PROMPT = (
-    "Jarvus. Hey Jarvus. Open the app, read my notifications, set a timer, "
-    "weather, reminder, calendar, alarm, volume, brightness, mute, screenshot, "
-    "clipboard, play music, pause, next track, send a message, email, notes, "
-    "web search, list files, read file, screenshot, run command, system info."
+    "Jarvus. Hey Jarvus. Open WhatsApp, Safari, Finder, Messages, Mail, Notes, "
+    "Calendar, Music, Spotify, Slack, Terminal, Microsoft Word, Excel, Telegram, "
+    "Chrome. Read my notifications, set a timer, weather, reminder, alarm, "
+    "volume, brightness, mute, screenshot, clipboard, play music, pause, "
+    "next track, send a message, email, notes, web search, list files, "
+    "read file, run command, system info, battery."
 )
 
 # Friendly names -> mlx-community HF repo
@@ -58,7 +78,13 @@ class MLXWhisperSTT:
             initial_prompt=HOTWORDS_PROMPT,
             no_speech_threshold=0.6,
         )
-        return (result.get("text") or "").strip()
+        # Drop segments the decoder itself flags as non-speech - this is where
+        # silence hallucinations ('Thank you.') come from.
+        segments = result.get("segments") or []
+        if segments and all(s.get("no_speech_prob", 0.0) > 0.6 for s in segments):
+            return ""
+        text = (result.get("text") or "").strip()
+        return "" if _is_hallucination(text) else text
 
 
 class FasterWhisperSTT:
@@ -77,7 +103,11 @@ class FasterWhisperSTT:
         segments, _ = self._model.transcribe(
             audio_f32, beam_size=1, vad_filter=True, initial_prompt=HOTWORDS_PROMPT
         )
-        return " ".join(seg.text.strip() for seg in segments).strip()
+        segs = list(segments)
+        if segs and all(getattr(s, "no_speech_prob", 0.0) > 0.6 for s in segs):
+            return ""
+        text = " ".join(seg.text.strip() for seg in segs).strip()
+        return "" if _is_hallucination(text) else text
 
 
 _lock = threading.Lock()

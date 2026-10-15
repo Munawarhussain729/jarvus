@@ -1,7 +1,9 @@
 """Full agent with extended capabilities."""
 from __future__ import annotations
 
+import logging
 import re
+import time
 from typing import Any
 
 from app.assistant.core import AssistantSession, SYSTEM_PROMPT
@@ -17,9 +19,10 @@ CAPABILITIES (call tools with valid arguments only):
 - open_app / say / volume / send_notification / read_notifications / screenshot / clipboard / frontmost_app: macOS control & notifications
 - read_file / write_file / list_dir / glob_files: file operations (sandboxed)
 - run_command (HIGH risk) / shell_read / python_exec: execution
-- plan / todo_write: planning
+- plan / todo_write: planning & persistent task list (set/add/complete/list)
 - system_info / ps_list / clock / battery: system info, time & date, battery
 - weather / timer / alarm / reminder / calendar: everyday tasks
+- list_reminders / calendar_read / daily_brief: see and analyse today's tasks
 - music / message / email: apps and communication
 - web_search / web_fetch: internet
 - scratchpad: the user's own notes file (NOT system notifications)
@@ -38,11 +41,14 @@ PRINCIPLES:
 
 MAX_CONTEXT_MESSAGES = 40
 
+log = logging.getLogger("jarvus.agent")
+
 
 class JarvusAgent(AssistantSession):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, tool_prefilter: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._system_prompt = AGENT_SYSTEM_PROMPT
+        self._tool_prefilter = tool_prefilter
 
     def _prompt_with_facts(self) -> str:
         if isinstance(self._memory, EnhancedMemory):
@@ -87,16 +93,38 @@ class JarvusAgent(AssistantSession):
             return reply
 
         self._trim_context()
-        tools = self._registry.openai_tools_payload()
+        # Heuristic prefilter: shrink the schema payload for the small local
+        # model. Union-matching + always-on core; expanded to the full set once
+        # a tool round has run (results may need a tool outside the subset).
+        from app.assistant.intents import tool_subset_for
+        subset = tool_subset_for(cleaned) if self._tool_prefilter else None
+        tools = self._registry.tools_payload_for(subset)
+        subset_applied = subset is not None
+        system_prompt = self._prompt_with_facts()  # once per turn, not per round
         nudged = False
         rounds = 0
+        t0 = time.monotonic()
+        logged = False
         while rounds < self._max_tool_rounds:
             rounds += 1
+            if rounds > 1 and subset_applied:
+                tools = self._registry.tools_payload_for(None)
+                subset_applied = False
             turn = self._provider.generate(
-                system_prompt=self._prompt_with_facts(),
+                system_prompt=system_prompt,
                 messages=self._messages,
                 tools=tools,
             )
+            if not logged:
+                logged = True
+                # Feeds the Phase 4 decision: only a FIRST call of exactly one
+                # no-arg tool counts as a System One candidate.
+                single_noarg = (
+                    len(turn.tool_calls or []) == 1
+                    and (turn.tool_calls[0].arguments_json or "").strip() in ("", "{}")
+                )
+                log.info("llm_turn regex_hit=False latency_ms=%d resolved_single_noarg=%s tools=%d",
+                         int((time.monotonic() - t0) * 1000), single_noarg, len(tools))
             if turn.tool_calls:
                 self._memory.append_message("assistant", turn.content or f"(tools: {len(turn.tool_calls)})")
                 self._messages.append({

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -93,13 +94,26 @@ class TestVoiceConfirmer:
         v = JarvusVoice(agent, listener=listener, tts=tts, always_speak=False)
         return v
 
-    @pytest.mark.parametrize("answer", ["yes", "yeah", "confirm", "go ahead", "yes.", "Okay!", "yes please"])
+    @pytest.mark.parametrize("answer", ["yes", "yeah", "confirm", "go ahead", "yes.", "Okay!", "yes please",
+                                        "jarvus, yes.", "hey jarvis okay", "jarvus yes"])
     def test_approvals(self, answer):
         assert self._make_voice(answer).voice_confirmer("run_command", "x") is True
 
     @pytest.mark.parametrize("answer", ["no", "nope", "", "maybe", "yes I think"])
     def test_rejections(self, answer):
         assert self._make_voice(answer).voice_confirmer("run_command", "x") is False
+
+
+class TestHallucinationFilter:
+    def test_whisper_silence_artifacts_dropped(self):
+        from app.voice.stt import _is_hallucination
+        for t in ["Thank you.", "Thanks for watching!", "All right.", "Bye", "Hmm", "you", "..."]:
+            assert _is_hallucination(t), t
+
+    def test_real_speech_kept(self):
+        from app.voice.stt import _is_hallucination
+        for t in ["open safari", "yes", "no", "okay", "set a timer", "Microsoft Word"]:
+            assert not _is_hallucination(t), t
 
 
 class TestCleanForSpeech:
@@ -180,3 +194,215 @@ class TestNotesTool:
         assert "buy milk" in t.run({"action": "list"}).payload
         assert "buy milk" in t.run({"action": "search", "text": "milk"}).payload
         assert "No notes matching" in t.run({"action": "search", "text": "eggs"}).payload
+
+
+class TestTaskIntents:
+    def test_daily_brief_phrases(self):
+        from app.assistant.intents import match
+        for phrase in ["brief me on my day", "what's on today", "what do i have today",
+                       "analyse my tasks", "how's my day", "what's my schedule"]:
+            assert match(phrase) == ("daily_brief", "{}"), phrase
+
+    def test_read_intents(self):
+        from app.assistant.intents import match
+        assert match("list my reminders") == ("list_reminders", "{}")
+        assert match("what's on my calendar") == ("calendar_read", "{}")
+        name, args = match("show my todos")
+        assert name == "todo_write" and '"action": "list"' in args
+
+    def test_reminder_create_still_distinct(self):
+        from app.assistant.intents import match
+        assert match("remind me to call mom") == ("reminder", '{"text": "call mom"}')
+
+
+class TestPersistentTodos:
+    @pytest.fixture()
+    def memory(self, tmp_path):
+        from app.memory.enhanced import EnhancedMemory
+        m = EnhancedMemory(tmp_path / "test.db")
+        yield m
+        m.close()
+
+    def test_set_add_complete_list(self, memory):
+        from app.tools.plan import TodoWriteTool
+        t = TodoWriteTool(memory)
+        assert t.run({"todos": [{"content": "ship it", "status": "pending", "priority": "high"}]}).ok
+        assert "ship it" in memory.list_todos()[0]["content"]
+        assert t.run({"action": "add", "content": "call bob", "priority": "low"}).ok
+        assert len(memory.list_todos()) == 2
+        assert t.run({"action": "complete", "content": "ship"}).ok
+        open_todos = memory.list_todos()
+        assert len(open_todos) == 1 and open_todos[0]["content"] == "call bob"
+        assert "call bob" in t.run({"action": "list"}).payload
+
+    def test_complete_no_match(self, memory):
+        from app.tools.plan import TodoWriteTool
+        res = TodoWriteTool(memory).run({"action": "complete", "content": "ghost"})
+        assert res.ok and "No open todos" in res.payload
+
+    def test_plan_persists(self, memory):
+        from app.tools.plan import PlanTool
+        assert PlanTool(memory).run({"goal": "launch", "steps": ["a", "b"]}).ok
+        cur = memory._conn.execute("SELECT name, status FROM plans")
+        row = cur.fetchone()
+        assert row["name"] == "launch" and row["status"] == "active"
+
+
+class TestReadTools:
+    """AppleScript is mocked at the module where it's bound (app.tools.reminders.run)."""
+
+    def _mock_run(self, monkeypatch, payload="", ok=True):
+        from app.tools.base import ToolResult
+        import app.tools.reminders as R
+        monkeypatch.setattr(R, "run", lambda script, timeout=15, ok_payload="done":
+                            ToolResult(ok=ok, payload=payload))
+        return R
+
+    def test_list_reminders_parses_and_filters(self, monkeypatch):
+        now = datetime.now()
+        past = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
+        today = now.strftime("%Y-%m-%d %H:%M")
+        self._mock_run(monkeypatch, f"Buy milk|Reminders|{past}\nCall mom|Home|{today}\nSomeday|Misc|\n")
+        from app.tools.reminders import ListRemindersTool
+        t = ListRemindersTool()
+        res = t.run({"when": "all"})
+        assert res.ok and "Buy milk" in res.payload and "OVERDUE" in res.payload and "Someday" in res.payload
+        res = t.run({"when": "today"})
+        assert "Call mom" in res.payload and "Someday" not in res.payload
+        res = t.run({"when": "overdue"})
+        assert "Buy milk" in res.payload and "Call mom" not in res.payload
+
+    def test_list_reminders_permission_denied(self, monkeypatch):
+        self._mock_run(monkeypatch, payload="execution error: Not authorized to send Apple events (-1743)", ok=False)
+        from app.tools.reminders import ListRemindersTool
+        res = ListRemindersTool().run({})
+        assert not res.ok and "Privacy" in res.payload
+
+    def test_calendar_read_parses(self, monkeypatch):
+        now = datetime.now()
+        self._mock_run(monkeypatch,
+                       f"Standup|Work|{now.strftime('%Y-%m-%d %H:%M')}|{now.strftime('%Y-%m-%d %H:%M')}|false\n")
+        from app.tools.reminders import CalendarReadTool
+        res = CalendarReadTool().run({"day": "today"})
+        assert res.ok and "Standup" in res.payload
+
+    def test_day_bounds(self):
+        from app.tools.reminders import day_bounds
+        s, e = day_bounds("today")
+        now = datetime.now()
+        assert (s.hour, s.minute) == (0, 0) and s.date() == now.date() and (e - s).days == 1
+        s2, e2 = day_bounds("week")
+        assert (e2 - s2).days == 7
+        assert day_bounds("blargh") is None
+
+
+class TestDailyBrief:
+    def _memory(self, tmp_path):
+        from app.memory.enhanced import EnhancedMemory
+        return EnhancedMemory(tmp_path / "t.db")
+
+    def _fns(self, events=None, reminders=None, ev_err="", rem_err=""):
+        now = datetime.now()
+        return {
+            "bounds": lambda d="today", days=1: (now.replace(hour=0, minute=0, second=0, microsecond=0),
+                                                 now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)),
+            "events": lambda s, e: (events or [], ev_err),
+            "reminders": lambda limit=200: (reminders or [], rem_err),
+        }
+
+    def test_empty_day(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVUS_DATA_DIR", str(tmp_path / "nodata"))
+        from app.tools.briefing import gather_day_digest
+        out = gather_day_digest(self._memory(tmp_path), self._fns())
+        assert "Nothing on the schedule" in out
+
+    def test_merges_events_reminders_todos(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVUS_DATA_DIR", str(tmp_path / "nope"))
+        mem = self._memory(tmp_path)
+        mem.add_todo("finish report", "pending", "high")
+        now = datetime.now()
+        fns = self._fns(
+            events=[{"title": "Standup", "calendar": "Work", "start": now, "end": now, "all_day": False}],
+            reminders=[{"text": "Pay bill", "list": "Home",
+                        "due": now - timedelta(days=1), }],
+        )
+        from app.tools.briefing import gather_day_digest
+        out = gather_day_digest(mem, fns)
+        assert "event" in out and "Standup" in out and "Pay bill" in out and "todo" in out
+        mem.close()
+
+    def test_permission_error_surfaced_not_raised(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVUS_DATA_DIR", str(tmp_path / "nodata"))
+        from app.tools.briefing import gather_day_digest
+        out = gather_day_digest(None, self._fns(rem_err="macOS denied access"))
+        assert "denied" in out
+
+
+class TestAutoBrief:
+    def test_fires_once_per_local_day(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVUS_DATA_DIR", str(tmp_path / "nodata"))
+        from app.memory.enhanced import EnhancedMemory
+        from app.tools.briefing import maybe_auto_brief
+        mem = EnhancedMemory(tmp_path / "t.db")
+        now = datetime.now()
+        fns = {
+            "bounds": lambda d="today", days=1: (now, now + timedelta(days=1)),
+            "events": lambda s, e: ([], ""),
+            "reminders": lambda limit=200: ([], ""),
+        }
+        # First call today fires (digest or nothing-scheduled message)
+        assert maybe_auto_brief(mem, enabled=True, read_fns=fns) is not None
+        # Same local day -> no repeat
+        assert maybe_auto_brief(mem, enabled=True, read_fns=fns) is None
+        # Local-date rollover -> fires again (not UTC: stored as local ISO date)
+        yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+        mem.set_meta("last_brief_date", yesterday)
+        assert maybe_auto_brief(mem, enabled=True, read_fns=fns) is not None
+        # Disabled / memory without meta -> never fires
+        assert maybe_auto_brief(mem, enabled=False, read_fns=fns) is None
+        mem.close()
+
+
+class TestToolPrefilter:
+    """False negatives are the silent-failure risk: a dropped tool is
+    unrecoverable, so every ambiguous command must keep its tools."""
+
+    def test_no_keyword_returns_full_set(self):
+        from app.assistant.intents import tool_subset_for
+        assert tool_subset_for("tell me a joke") is None
+        assert tool_subset_for("what is the meaning of life") is None
+
+    def test_union_not_first_match_open_file(self):
+        from app.assistant.intents import tool_subset_for
+        s = tool_subset_for("open the file report.txt")
+        # 'open' matches the app group AND 'file' matches file tools - both kept
+        assert {"open_app", "read_file", "write_file"} <= set(s)
+
+    def test_task_keywords_keep_task_tools(self):
+        from app.assistant.intents import tool_subset_for
+        for phrase, needed in [
+            ("remind me to water the plants", "reminder"),
+            ("what's on my calendar tomorrow", "calendar_read"),
+            ("put 'buy eggs' on my task list", "todo_write"),
+            ("set a timer for tea", "timer"),
+        ]:
+            s = tool_subset_for(phrase)
+            assert s is not None and needed in s, (phrase, needed)
+
+    def test_core_always_present(self):
+        from app.assistant.intents import tool_subset_for
+        s = tool_subset_for("what is my battery at")
+        assert {"remember", "recall", "scratchpad", "todo_write", "daily_brief"} <= set(s)
+        assert "battery" in s
+
+    def test_payload_subset_via_registry(self, tmp_path):
+        from app.bootstrap import build_registry
+        from app.memory.enhanced import EnhancedMemory
+        reg = build_registry(EnhancedMemory(tmp_path / "t.db"))
+        full = reg.openai_tools_payload()
+        sub = reg.tools_payload_for({"clock", "timer"})
+        assert {t["function"]["name"] for t in sub} == {"clock", "timer"}
+        assert len(reg.tools_payload_for(None)) == len(full)
+        # cached payload returns fresh lists - mutating one doesn't corrupt cache
+        sub.append({"x": 1})
+        assert len(reg.openai_tools_payload()) == len(full)

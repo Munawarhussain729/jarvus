@@ -1,7 +1,9 @@
 """macOS-specific system control tools."""
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from app.security.policy import RiskLevel
@@ -9,10 +11,30 @@ from app.security.sanitize import sanitize_tool_argument_string
 from app.tools.base import Tool, ToolResult, ToolSpec
 
 
+_APP_DIRS = ("/Applications", "/System/Applications", str(Path.home() / "Applications"))
+
+
+def _resolve_app(name: str) -> str | None:
+    """Find the real app name (e.g. 'whats app' -> 'WhatsApp') in app dirs."""
+    base = name[:-4] if name.lower().endswith(".app") else name
+    want = base.lower().replace(" ", "")
+    for d in _APP_DIRS:
+        try:
+            for entry in os.scandir(d):
+                if not entry.is_dir():
+                    continue
+                stem = entry.name[:-4] if entry.name.lower().endswith(".app") else entry.name
+                if stem.lower().replace(" ", "") == want:
+                    return stem
+        except OSError:
+            continue
+    return None
+
+
 class OpenAppTool(Tool):
     spec = ToolSpec(
         name="open_app",
-        description="Open an application on macOS (e.g., 'WhatsApp', 'Safari', 'Terminal'). HIGH risk.",
+        description="Open an application on macOS (e.g., 'WhatsApp', 'Safari', 'Terminal').",
         parameters_schema={
             "type": "object",
             "properties": {
@@ -21,7 +43,10 @@ class OpenAppTool(Tool):
             },
             "additionalProperties": False,
         },
-        risk=RiskLevel.HIGH,
+        # MEDIUM: launching a resolved named app is low blast-radius - no
+        # confirmation, so voice 'open X' just works. HIGH stays for
+        # run_command/python_exec/web_fetch.
+        risk=RiskLevel.MEDIUM,
     )
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
@@ -32,11 +57,16 @@ class OpenAppTool(Tool):
             return ToolResult(ok=False, payload=str(e))
         if not app_name and not url:
             return ToolResult(ok=False, payload="need app_name or url")
+
+        if app_name:
+            # Voice transcripts arrive as 'whatsapp.' - strip punctuation and
+            # resolve 'whats app'/'Word' against the real app dirs.
+            cleaned = app_name.strip().strip(".,!?:;").strip()
+            app_name = _resolve_app(cleaned) or cleaned
+
         args = ["open"]
         if app_name:
-            # add .app if missing and not a path
             if "/" not in app_name and not app_name.endswith(".app"):
-                # try both? just pass as-is
                 args.extend(["-a", app_name])
             else:
                 args.append(app_name)
@@ -45,7 +75,10 @@ class OpenAppTool(Tool):
         try:
             proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
             out = (proc.stdout or "") + (proc.stderr or "")
-            return ToolResult(ok=proc.returncode == 0, payload=out or f"opened", detail={"code": proc.returncode})
+            if proc.returncode != 0:
+                out = out.strip() or "open failed"
+                out += f" (tried '{app_name}'; check /Applications for the exact name)"
+            return ToolResult(ok=proc.returncode == 0, payload=out or "opened", detail={"code": proc.returncode})
         except Exception as e:
             return ToolResult(ok=False, payload=str(e))
 
