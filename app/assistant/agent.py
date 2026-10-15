@@ -16,15 +16,18 @@ from app.models.base import ModelProvider
 AGENT_SYSTEM_PROMPT = """You are Jarvus, an autonomous local AI agent running 100% locally with strict security. Think of yourself as JARVIS from Iron Man - helpful, capable, proactive, concise.
 
 CAPABILITIES (call tools with valid arguments only):
-- open_app / say / volume / send_notification / read_notifications / screenshot / clipboard / frontmost_app: macOS control & notifications
-- read_file / write_file / list_dir / glob_files: file operations (sandboxed)
+- open_app / open_url / say / volume / send_notification / read_notifications / screenshot / clipboard / frontmost_app: macOS control & notifications
+- dark_mode / lock_screen / sleep_display / run_shortcut / empty_trash: more macOS control
+- read_file / write_file / list_dir / glob_files / find_files: file operations & Spotlight search (sandboxed)
 - run_command (HIGH risk) / shell_read / python_exec: execution
 - plan / todo_write: planning & persistent task list (set/add/complete/list)
-- system_info / ps_list / clock / battery: system info, time & date, battery
+- system_info / ps_list / clock / date_calc / battery / network_info: system, time & date, network
 - weather / timer / alarm / reminder / calendar: everyday tasks
 - list_reminders / calendar_read / daily_brief: see and analyse today's tasks
 - music / message / email: apps and communication
-- web_search / web_fetch: internet
+- web_search / web_fetch / wikipedia / news / currency / crypto / stock / joke: internet & live facts
+- calculate / unit_convert: math and unit conversion - ALWAYS use these for arithmetic or conversions, never do them mentally
+- random / text_tools: coin flips, dice, passwords, uuid, base64/hash/case transforms
 - scratchpad: the user's own notes file (NOT system notifications)
 - remember / recall / forget: long-term memory of user facts
 
@@ -40,6 +43,9 @@ PRINCIPLES:
 """ + "\n\n" + SYSTEM_PROMPT
 
 MAX_CONTEXT_MESSAGES = 40
+# Cap tool results fed back to the model: keeps the small local model's context
+# lean (faster inference) and stops one huge payload from evicting real history.
+MAX_TOOL_RESULT_CHARS = 4000
 
 log = logging.getLogger("jarvus.agent")
 
@@ -87,6 +93,8 @@ class JarvusAgent(AssistantSession):
         if hit:
             tool_name, args_json = hit
             body = self._router.handle_tool_call(tool_name=tool_name, arguments_json=args_json)
+            if len(body) > MAX_TOOL_RESULT_CHARS:
+                body = body[:MAX_TOOL_RESULT_CHARS] + "\n... (truncated)"
             reply = re.sub(r"^\[tool (ok|error|cancelled)\]\s*", "", body)
             self._memory.append_message("assistant", reply)
             self._messages.append({"role": "assistant", "content": reply})
@@ -137,6 +145,8 @@ class JarvusAgent(AssistantSession):
                 })
                 for tc in turn.tool_calls:
                     body = self._router.handle_tool_call(tool_name=tc.name, arguments_json=tc.arguments_json)
+                    if len(body) > MAX_TOOL_RESULT_CHARS:
+                        body = body[:MAX_TOOL_RESULT_CHARS] + "\n... (truncated)"
                     self._messages.append({"role": "tool", "tool_call_id": tc.id, "content": body})
                 self._trim_context()
                 continue
@@ -158,7 +168,9 @@ class JarvusAgent(AssistantSession):
 
 
 _PROMISE_PATTERNS = ("let me ", "i'll ", "i will ", "i can help you", "i can check",
-                   "going to ", "allow me", "i'll check", "i'm going to")
+                   "going to ", "allow me", "i'll check", "i'm going to",
+                   "one moment", "please wait", "working on it", "give me a second",
+                   "i'm checking", "let me check")
 
 
 def _looks_like_unfulfilled_action(reply: str) -> bool:

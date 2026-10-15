@@ -13,14 +13,14 @@ from app.tools.base import Tool, ToolResult, ToolSpec
 class WeatherTool(Tool):
     spec = ToolSpec(
         name="weather",
-        description="Get current weather for a city. Uses wttr.in (no API key needed).",
+        description="Get current weather for a city (empty = auto-detect location). Uses wttr.in, no key.",
         parameters_schema={
             "type": "object",
             "properties": {
-                "city": {"type": "string", "description": "City name (e.g., 'London', 'Tokyo')"},
+                "city": {"type": "string", "description": "City name (e.g., 'London', 'Tokyo'); "
+                                                          "empty = auto-detect from IP", "default": ""},
                 "format": {"type": "string", "enum": ["short", "full"], "default": "short"},
             },
-            "required": ["city"],
             "additionalProperties": False,
         },
         risk=RiskLevel.LOW,
@@ -28,7 +28,7 @@ class WeatherTool(Tool):
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:
-            city = sanitize_tool_argument_string(arguments["city"], field_name="city")
+            city = sanitize_tool_argument_string(str(arguments.get("city") or ""), field_name="city").strip()
         except Exception as e:
             return ToolResult(ok=False, payload=str(e))
 

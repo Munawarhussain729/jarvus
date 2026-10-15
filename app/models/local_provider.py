@@ -7,6 +7,7 @@ Works against:
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from app.models.base import AssistantTurn, ModelProvider, ToolCall
@@ -112,24 +113,29 @@ class LocalProvider(ModelProvider):
         }
         if tools:
             payload["tools"] = tools
-        try:
-            r = self._client().post(f"{self._base}/api/chat", json=payload)
-            r.raise_for_status()
-            msg = r.json().get("message", {})
-            tool_calls = []
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                args = fn.get("arguments")
-                if not isinstance(args, str):
-                    args = json.dumps(args or {})
-                tool_calls.append(ToolCall(
-                    id=tc.get("id") or f"call_{len(tool_calls)}",
-                    name=fn.get("name", ""),
-                    arguments_json=args,
-                ))
-            return AssistantTurn(content=msg.get("content"), tool_calls=tool_calls)
-        except Exception as e:
-            return AssistantTurn(content=f"[local model error] {e}", tool_calls=[])
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                r = self._client().post(f"{self._base}/api/chat", json=payload)
+                r.raise_for_status()
+                msg = r.json().get("message", {})
+                tool_calls = []
+                for tc in msg.get("tool_calls") or []:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments")
+                    if not isinstance(args, str):
+                        args = json.dumps(args or {})
+                    tool_calls.append(ToolCall(
+                        id=tc.get("id") or f"call_{len(tool_calls)}",
+                        name=fn.get("name", ""),
+                        arguments_json=args,
+                    ))
+                return AssistantTurn(content=msg.get("content"), tool_calls=tool_calls)
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(0.4)  # one quick retry on transient errors
+        return AssistantTurn(content=f"[local model error] {last_err}", tool_calls=[])
 
     def _generate_openai_compat(self, api_messages: list[dict[str, Any]], tools) -> AssistantTurn:
         try:
@@ -148,12 +154,17 @@ class LocalProvider(ModelProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        try:
-            resp = client.chat.completions.create(**kwargs)
-            msg = resp.choices[0].message
-            tool_calls = []
-            for tc in msg.tool_calls or []:
-                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments_json=tc.function.arguments or "{}"))
-            return AssistantTurn(content=msg.content, tool_calls=tool_calls)
-        except Exception as e:
-            return AssistantTurn(content=f"[local model error] {e}", tool_calls=[])
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = client.chat.completions.create(**kwargs)
+                msg = resp.choices[0].message
+                tool_calls = []
+                for tc in msg.tool_calls or []:
+                    tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments_json=tc.function.arguments or "{}"))
+                return AssistantTurn(content=msg.content, tool_calls=tool_calls)
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(0.4)  # one quick retry on transient errors
+        return AssistantTurn(content=f"[local model error] {last_err}", tool_calls=[])

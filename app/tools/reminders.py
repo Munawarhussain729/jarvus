@@ -97,9 +97,15 @@ def day_bounds(day: str = "today", days: int = 1) -> tuple[datetime, datetime] |
     day = (day or "today").strip().lower()
     if day in ("week", "this week"):
         day, days = "today", max(days, 7)
-    d = _parse_due(day)
-    if d is None:
-        return None
+    if day == "today":
+        # _parse_due("today") means 'an hour from now' (reminder semantics) -
+        # which rolls into tomorrow after 23:00. Day bounds always mean
+        # calendar-today.
+        d = datetime.now()
+    else:
+        d = _parse_due(day)
+        if d is None:
+            return None
     start = d.replace(hour=0, minute=0, second=0, microsecond=0)
     return start, start + timedelta(days=max(1, int(days)))
 

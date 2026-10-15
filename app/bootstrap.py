@@ -14,8 +14,10 @@ from app.tools.clock import ClockTool
 from app.tools.code import PythonExecTool
 from app.tools.docx import CreateDocxTool
 from app.tools.filesystem import GlobTool, ListDirTool, ReadFileTool, WriteFileTool
+from app.tools.internet import CryptoTool, CurrencyTool, JokeTool, NetworkInfoTool, NewsTool, StockTool, WikipediaTool
 from app.tools.macos import OpenAppTool, SayTool
 from app.tools.macos_control import BatteryTool, ClipboardTool, FrontAppTool, NotifyTool, ScreenshotTool, VolumeTool
+from app.tools.macos_extra import DarkModeTool, EmptyTrashTool, FindFilesTool, LockScreenTool, OpenUrlTool, ShortcutTool, SleepDisplayTool
 from app.tools.memory_tools import ForgetTool, RecallTool, RememberTool
 from app.tools.messaging import EmailTool, MessageTool
 from app.tools.music import MusicTool
@@ -31,6 +33,7 @@ from app.tools.shell_extended import ShellReadOnlyTool
 from app.tools.system import PsTool, SystemInfoTool
 from app.tools.terminal import RunCommandTool
 from app.tools.timer import AlarmTool, TimerTool
+from app.tools.utilities import CalcTool, DateCalcTool, RandomTool, TextTool, UnitConvertTool
 from app.tools.weather import WeatherTool
 from app.tools.web import WebFetchTool
 
@@ -75,6 +78,25 @@ def build_registry(memory: EnhancedMemory) -> ToolRegistry:
         FrontAppTool(),
         BatteryTool(),
         NoteTool(),
+        CalcTool(),
+        UnitConvertTool(),
+        DateCalcTool(),
+        RandomTool(),
+        TextTool(),
+        CurrencyTool(),
+        CryptoTool(),
+        StockTool(),
+        NewsTool(),
+        WikipediaTool(),
+        JokeTool(),
+        NetworkInfoTool(),
+        FindFilesTool(),
+        OpenUrlTool(),
+        DarkModeTool(),
+        LockScreenTool(),
+        SleepDisplayTool(),
+        ShortcutTool(),
+        EmptyTrashTool(),
         RememberTool(memory),
         RecallTool(memory),
         ForgetTool(memory),

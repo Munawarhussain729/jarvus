@@ -146,7 +146,9 @@ class TestQuickIntents:
 
     def test_no_match_falls_through(self):
         from app.assistant.intents import match
-        assert match("tell me a joke") is None
+        # 'what is <concept>' now routes to wikipedia
+        assert match("what is the meaning of life") == ("wikipedia", '{"topic": "meaning of life"}')
+        assert match("hmm, let me think about that") is None
         assert match("open the file report.txt") is None
 
     def test_clock_and_notifications(self):
@@ -160,7 +162,8 @@ class TestQuickIntents:
         assert match("how much battery is left") == ("battery", "{}")
         assert match("is my macbook charging") == ("battery", "{}")
         assert match("look up iphone 18") == ("web_search", '{"query": "iphone 18"}')
-        assert match("search my files for receipts") is None
+        name, args = match("search my files for receipts")
+        assert name == "find_files" and '"query": "receipts"' in args
         assert match("remind me to call mom") == ("reminder", '{"text": "call mom"}')
 
 
@@ -369,7 +372,7 @@ class TestToolPrefilter:
 
     def test_no_keyword_returns_full_set(self):
         from app.assistant.intents import tool_subset_for
-        assert tool_subset_for("tell me a joke") is None
+        assert tool_subset_for("hmm, let me think about that") is None
         assert tool_subset_for("what is the meaning of life") is None
 
     def test_union_not_first_match_open_file(self):
