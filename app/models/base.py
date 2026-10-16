@@ -31,10 +31,13 @@ class ModelProvider(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         on_delta: Callable[[str], None] | None = None,
+        max_tokens: int | None = None,
     ) -> AssistantTurn:
         """Call remote or local model; must not execute tools.
 
         on_delta (optional): receives content text chunks as they stream in,
         so voice mode can start speaking the first sentence while the rest
         generates. Providers without streaming support may ignore it.
+        max_tokens (optional): per-call output budget override - the agent
+        raises it for code-creation requests.
         """

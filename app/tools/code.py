@@ -45,6 +45,30 @@ class CreateCodeTool(Tool):
             return ToolResult(ok=False, payload="filename may only contain letters, digits, ._-")
         if "." not in filename:
             filename += ".py"
+
+        # Validate BEFORE writing - a syntax error must not clobber a working
+        # file the user already has. Check the source in memory first.
+        if filename.endswith(".py"):
+            try:
+                compile(code, filename, "exec")
+            except SyntaxError as e:
+                return ToolResult(
+                    ok=False,
+                    payload=(f"Syntax error in generated code (line {e.lineno}): {e.msg}. "
+                             "No file was written - fix the code and retry create_code_file."),
+                    detail={"filename": filename, "line": e.lineno},
+                )
+        elif filename.endswith(".sh"):
+            chk = subprocess.run(["bash", "-n"], input=code,
+                                 capture_output=True, text=True, timeout=15)
+            if chk.returncode != 0:
+                return ToolResult(
+                    ok=False,
+                    payload=f"Bash syntax error: {(chk.stderr or '').strip()}. "
+                            "No file was written - fix and retry create_code_file.",
+                    detail={"filename": filename},
+                )
+
         try:
             PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
             path = PROJECTS_DIR / filename
@@ -52,13 +76,7 @@ class CreateCodeTool(Tool):
         except Exception as e:
             return ToolResult(ok=False, payload=str(e))
         lines = code.count("\n") + 1
-        payload = f"Saved {path} ({lines} lines)"
-        if filename.endswith(".py"):
-            try:
-                compile(code, str(path), "exec")
-                payload += ", syntax OK"
-            except SyntaxError as e:
-                return ToolResult(ok=False, payload=f"{payload} - but syntax error: {e}")
+        payload = f"Saved {path} ({lines} lines, syntax OK)"
         payload += ". Tell the user it is saved and can be run or opened."
         return ToolResult(ok=True, payload=payload, detail={"path": str(path)})
 

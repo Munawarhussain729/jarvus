@@ -15,7 +15,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from app.voice.stt import SAMPLE_RATE, SpeechToText, get_stt
+from app.voice.stt import SAMPLE_RATE, SpeechToText, get_stt, has_speech
 
 log = logging.getLogger("jarvus.voice.listener")
 
@@ -55,8 +55,12 @@ class VoiceListener:
         # When set, captured audio is drained and discarded (echo suppression).
         self.paused = threading.Event()
         # When set, the next transcribed phrase is a command even without a wake word
-        # (used after Jarvus answers a lone "Jarvis?" with "Yes?").
+        # (used after Jarvus answers a lone "Jarvis?" with "Yes?"). Auto-expires so
+        # an unanswered follow-up can't arm a later utterance forever.
         self.expect_command = threading.Event()
+        self._expect_deadline = 0.0
+        # Observable pipeline state for logs/diagnostics.
+        self.state = "idle"  # idle | listening | processing | speaking | confirming
 
         self._stt = stt  # lazily resolved via get_stt(engine, model)
         self._stt_engine = stt_engine
@@ -89,7 +93,7 @@ class VoiceListener:
     def _transcribe(self, audio) -> str:
         raw = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
         arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        if not arr.size or float(np.sqrt(np.mean(arr * arr))) < self._silence_rms:
+        if not has_speech(arr, rms_gate=self._silence_rms):
             return ""
         t0 = time.monotonic()
         text = self._engine().transcribe(arr)
@@ -148,10 +152,15 @@ class VoiceListener:
                     one_shot = self._one_shot
                 if one_shot is not None:
                     try:
-                        one_shot.put(self._transcribe(audio))
+                        one_shot.put_nowait(self._transcribe(audio))
+                    except queue.Full:
+                        log.debug("one-shot answer dropped (queue full)")
                     except Exception as e:
                         log.debug("one-shot transcribe error: %s", e)
-                        one_shot.put("")
+                        try:
+                            one_shot.put_nowait("")
+                        except queue.Full:
+                            pass
                     continue
 
                 try:
@@ -172,6 +181,9 @@ class VoiceListener:
 
                 if self.use_wake_word:
                     if self.expect_command.is_set():
+                        if time.monotonic() > self._expect_deadline:
+                            self.expect_command.clear()
+                            continue  # stale follow-up arm: require the wake word again
                         self.expect_command.clear()
                         self._dispatch(text)
                     elif self._contains_wake_word(text_low):
@@ -180,6 +192,11 @@ class VoiceListener:
                     self._dispatch(text)
         self.listening = False
         log.info("Voice listener stopped")
+
+    def arm_followup(self, seconds: float = 15.0) -> None:
+        """Arm expect_command with an expiry - a next utterance is a command."""
+        self._expect_deadline = time.monotonic() + seconds
+        self.expect_command.set()
 
     def listen_once(self, timeout: float = 8.0) -> str:
         """Capture one phrase and return its transcript (used for voice confirmations)."""

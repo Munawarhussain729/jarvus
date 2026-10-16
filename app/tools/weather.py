@@ -33,6 +33,11 @@ class WeatherTool(Tool):
             return ToolResult(ok=False, payload=str(e))
 
         fmt = arguments.get("format", "short")
+        from app.tools._cache import get as cache_get, put as cache_put
+        key = f"weather:{city.lower()}:{fmt}"
+        cached = cache_get(key)
+        if cached is not None:
+            return ToolResult(ok=True, payload=cached)
         try:
             if fmt == "full":
                 url = f"https://wttr.in/{city}?format=j1"
@@ -56,6 +61,7 @@ class WeatherTool(Tool):
                 city_name = data.get("nearest_area", [{}])[0].get("areaName", [{}])[0].get("value", city)
                 output = f"Weather in {city_name}: {desc}, {temp_c}°C ({temp_f}°F), humidity {humidity}%, wind {wind} km/h"
 
+            cache_put(key, output, ttl_s=300)
             return ToolResult(ok=True, payload=output)
         except TimeoutError:
             return ToolResult(ok=False, payload="Weather request timed out")

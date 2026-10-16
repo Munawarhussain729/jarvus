@@ -51,6 +51,58 @@ def _text_repl(agent, memory=None, *, auto_brief: bool = False) -> None:
             print(f"[error] {e}", file=sys.stderr)
 
 
+def _doctor(settings) -> None:
+    """Print effective (non-secret) config, backend reachability, and recent
+    turn timings - the answer to 'why is it slow?' without guessing."""
+    import importlib.util
+
+    print("== effective settings ==")
+    for f in ("profile", "llm_model", "llm_num_ctx", "llm_think", "llm_keep_alive",
+              "max_tokens", "temperature", "stt_engine", "stt_model",
+              "stt_no_speech_threshold", "stt_min_logprob", "stt_silence_rms",
+              "tts_engine", "tts_voice", "tool_prefilter", "auto_brief"):
+        print(f"  {f}: {getattr(settings, f)}")
+    print(f"  data_dir: {settings.data_dir}")
+
+    print("== ollama ==")
+    try:
+        import httpx
+        r = httpx.get(f"{settings.llm_base_url}/api/tags", timeout=5)
+        names = [m["name"] for m in r.json().get("models", [])]
+        installed = settings.llm_model in names
+        print(f"  reachable: yes | models: {len(names)} | configured model installed: {installed}")
+        if not installed:
+            print(f"  -> pull it: ollama pull {settings.llm_model}")
+    except Exception as e:
+        print(f"  reachable: no ({e})")
+
+    print("== local backends ==")
+    for mod, label in (("mlx_whisper", "MLX Whisper"), ("faster_whisper", "faster-whisper"),
+                       ("mlx_audio", "Kokoro MLX TTS"), ("speech_recognition", "speech_recognition"),
+                       ("pyaudio", "PyAudio")):
+        print(f"  {label}: {'ok' if importlib.util.find_spec(mod) else 'missing'}")
+
+    print("== recent turns (metrics.jsonl) ==")
+    try:
+        from app.telemetry import tail
+        rows = [r for r in tail(200) if r.get("event") in ("turn", "turn_done")]
+        if not rows:
+            print("  (no recorded turns yet)")
+        else:
+            walls = [r["wall_ms"] for r in rows if r.get("event") == "turn_done" and "wall_ms" in r]
+            stts = [r["stt_ms"] for r in rows if r.get("event") == "turn" and "stt_ms" in r]
+            ttss = [r["tts_ms"] for r in rows if r.get("event") == "turn" and "tts_ms" in r]
+            def _p(v): return f"p50={sorted(v)[len(v)//2]}ms max={max(v)}ms" if v else "n/a"
+            print(f"  turns={len(walls)} llm {_p(walls)} | stt {_p(stts)} | tts {_p(ttss)}")
+            outcomes = {}
+            for r in rows:
+                if r.get("event") == "turn_done":
+                    outcomes[r.get("outcome", "?")] = outcomes.get(r.get("outcome", "?"), 0) + 1
+            print(f"  outcomes: {outcomes}")
+    except Exception as e:
+        print(f"  metrics unavailable: {e}")
+
+
 def _run_voice(settings, agent, *, wake_word: bool, speak: bool, auto_brief: bool = False) -> None:
     from app.voice.listener import VoiceListener
     from app.voice.session import JarvusVoice
@@ -80,6 +132,7 @@ def _run_voice(settings, agent, *, wake_word: bool, speak: bool, auto_brief: boo
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopping...")
+        voice.stop()
         listener.stop()
 
 
@@ -95,10 +148,15 @@ def main() -> None:
     p.add_argument("--host", default=None, help="server bind host")
     p.add_argument("--port", type=int, default=None, help="server bind port")
     p.add_argument("--remote-url", default=None, help="talk to a remote Jarvus server instead of running locally")
+    p.add_argument("--doctor", action="store_true", help="print effective config + backend health, then exit")
     args = p.parse_args()
 
     settings = load_settings()
     _setup_logging(settings.log_level)
+
+    if args.doctor:
+        _doctor(settings)
+        return
 
     if args.serve:
         from app.server import run_server

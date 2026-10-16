@@ -44,9 +44,17 @@ PRINCIPLES:
 """ + "\n\n" + SYSTEM_PROMPT
 
 MAX_CONTEXT_MESSAGES = 40
+# Hard prompt budget (~6k tokens of role content) - a small num_ctx can't hold
+# 40 fat messages; the model would start answering its own truncated history.
+MAX_CONTEXT_CHARS = 24000
 # Cap tool results fed back to the model: keeps the small local model's context
 # lean (faster inference) and stops one huge payload from evicting real history.
 MAX_TOOL_RESULT_CHARS = 4000
+_CODE_MAX_TOKENS = 1024  # bigger output budget for code-creation turns
+# Requests that need the bigger generation budget.
+_CODE_REQUEST_RE = re.compile(
+    r"\b(?:make|write|create|build|code|generate|fix)\b.*"
+    r"\b(?:game|script|program|code|app|python|bot)\b", re.IGNORECASE)
 
 log = logging.getLogger("jarvus.agent")
 
@@ -65,8 +73,12 @@ class JarvusAgent(AssistantSession):
         return self._system_prompt
 
     def _trim_context(self) -> None:
-        """Keep the last MAX_CONTEXT_MESSAGES messages without orphaning tool results."""
+        """Keep recent messages within a message-count AND a char (~token)
+        budget, without orphaning tool results."""
         while len(self._messages) > MAX_CONTEXT_MESSAGES:
+            self._messages.pop(0)
+        while (sum(len(m.get("content") or "") for m in self._messages) > MAX_CONTEXT_CHARS
+               and len(self._messages) > 8):
             self._messages.pop(0)
         while self._messages and (
             self._messages[0].get("role") == "tool"
@@ -92,7 +104,9 @@ class JarvusAgent(AssistantSession):
                 prefix = content.split("]", 1)[0] + "]" if content.startswith("[tool") else ""
                 self._messages[i]["content"] = f"{prefix} (earlier output elided)".strip()
 
-    def process_user_text(self, text: str, *, on_delta=None) -> str:
+    def process_user_text(self, text: str, *, on_delta=None, speech=None) -> str:
+        """speech: optional _SpeechPipeline - aborts per-round pending text when
+        a round ends in tool calls so half-sentences never get spoken."""
         """on_delta: optional callback receiving reply text chunks as they
         stream (voice mode uses it to speak the first sentence early)."""
         from app.security.sanitize import sanitize_user_message, InputRejected
@@ -135,11 +149,22 @@ class JarvusAgent(AssistantSession):
         nudged = False
         rounds = 0
         tool_ms = 0
+        had_tool_error = False
+        cancelled = False
         t0 = time.monotonic()
         logged = False
+        # Same-turn dedupe: a repair retry can't re-fire a call that already
+        # succeeded (e.g. write_file again while fixing another tool's args).
+        executed: dict[tuple[str, str], str] = {}
+        # Code-creation turns need a bigger generation budget - 384 tokens
+        # truncates most real programs.
+        wants_code = bool(_CODE_REQUEST_RE.search(cleaned)) or (
+            subset is not None and "create_code_file" in subset)
+        gen_budget = _CODE_MAX_TOKENS if wants_code else None
         while rounds < self._max_tool_rounds:
             rounds += 1
-            if rounds > 1 and subset_applied:
+            if rounds > 1 and subset_applied and (had_tool_error or nudged):
+                # Expand the schema set only when the subset actually failed.
                 tools = self._registry.tools_payload_for(None)
                 subset_applied = False
             self._compact_tool_history(turn_start)
@@ -148,6 +173,7 @@ class JarvusAgent(AssistantSession):
                 messages=self._messages,
                 tools=tools,
                 on_delta=on_delta,
+                max_tokens=gen_budget,
             )
             if not logged:
                 logged = True
@@ -160,6 +186,8 @@ class JarvusAgent(AssistantSession):
                 log.info("llm_turn regex_hit=False latency_ms=%d resolved_single_noarg=%s tools=%d",
                          int((time.monotonic() - t0) * 1000), single_noarg, len(tools))
             if turn.tool_calls:
+                if speech is not None:
+                    speech.discard_pending()  # don't speak half-sentences of preamble
                 self._memory.append_message("assistant", turn.content or f"(tools: {len(turn.tool_calls)})")
                 self._messages.append({
                     "role": "assistant",
@@ -170,9 +198,21 @@ class JarvusAgent(AssistantSession):
                     ],
                 })
                 for tc in turn.tool_calls:
-                    tt = time.monotonic()
-                    body = self._router.handle_tool_call(tool_name=tc.name, arguments_json=tc.arguments_json)
-                    tool_ms += int((time.monotonic() - tt) * 1000)
+                    key = (tc.name, tc.arguments_json or "")
+                    if key in executed:
+                        body = executed[key]
+                        log.info("tool_dedupe skipped repeat of %s", tc.name)
+                    else:
+                        tt = time.monotonic()
+                        body = self._router.handle_tool_call(
+                            tool_name=tc.name, arguments_json=tc.arguments_json)
+                        tool_ms += int((time.monotonic() - tt) * 1000)
+                        if body.startswith("[tool ok]"):
+                            executed[key] = body
+                        if "[tool error]" in body:
+                            had_tool_error = True
+                        if "[tool cancelled]" in body:
+                            cancelled = True
                     if len(body) > MAX_TOOL_RESULT_CHARS:
                         body = body[:MAX_TOOL_RESULT_CHARS] + "\n... (truncated)"
                     self._messages.append({"role": "tool", "tool_call_id": tc.id, "content": body})
@@ -197,8 +237,17 @@ class JarvusAgent(AssistantSession):
             if not reply:
                 log.warning("llm_turn produced empty content")
                 reply = "Sorry, I didn't catch that - could you say it again?"
-            log.info("turn_done rounds=%d tool_ms=%d wall_ms=%d",
-                     rounds, tool_ms, int((time.monotonic() - t0) * 1000))
+            outcome = ("cancelled" if cancelled else
+                       "error" if had_tool_error else
+                       "clarify" if reply.strip().endswith("?") else "ok")
+            log.info("turn_done rounds=%d tool_ms=%d wall_ms=%d outcome=%s",
+                     rounds, tool_ms, int((time.monotonic() - t0) * 1000), outcome)
+            try:
+                from app.telemetry import record
+                record("turn_done", rounds=rounds, tool_ms=tool_ms,
+                       wall_ms=int((time.monotonic() - t0) * 1000), outcome=outcome)
+            except Exception:
+                pass
             self._memory.append_message("assistant", reply)
             self._messages.append({"role": "assistant", "content": reply})
             return reply

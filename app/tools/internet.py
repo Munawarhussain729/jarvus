@@ -130,6 +130,11 @@ class CryptoTool(Tool):
             vs = _clean_code(str(arguments.get("vs_currency") or "usd"), field="vs_currency").lower()
         except Exception as e:
             return ToolResult(ok=False, payload=str(e))
+        from app.tools._cache import get as _cget, put as _cput
+        ckey = f"crypto:{','.join(sorted(ids))}:{vs}"
+        cached = _cget(ckey)
+        if cached is not None:
+            return ToolResult(ok=True, payload=cached)
         url = ("https://api.coingecko.com/api/v3/simple/price"
                f"?ids={urllib.parse.quote(','.join(ids))}&vs_currencies={vs}&include_24hr_change=true")
         try:
@@ -145,7 +150,9 @@ class CryptoTool(Tool):
             chg = entry.get(f"{vs}_24h_change")
             chg_s = f" ({chg:+.1f}% 24h)" if isinstance(chg, (int, float)) else ""
             lines.append(f"{coin}: {_fmt_price(entry[vs])} {vs.upper()}{chg_s}")
-        return ToolResult(ok=True, payload="\n".join(lines))
+        payload = "\n".join(lines)
+        _cput(ckey, payload, ttl_s=120)  # live prices: short TTL
+        return ToolResult(ok=True, payload=payload)
 
 
 # ---- stocks ----------------------------------------------------------------
@@ -183,6 +190,11 @@ class StockTool(Tool):
         symbol = _STOCK_NAME_MAP.get(raw, raw.upper())
         if not re.fullmatch(r"[A-Z0-9.^=-]{1,12}", symbol):
             return ToolResult(ok=False, payload=f"invalid symbol: {arguments['symbol']!r}")
+        from app.tools._cache import get as _cget, put as _cput
+        ckey = f"stock:{symbol}"
+        cached = _cget(ckey)
+        if cached is not None:
+            return ToolResult(ok=True, payload=cached)
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?interval=1d&range=5d"
         try:
             data = _get_json(url, timeout=12, headers=_UA_BROWSER)
@@ -199,7 +211,9 @@ class StockTool(Tool):
         if prev:
             pct = (price - prev) / prev * 100
             chg = f" ({pct:+.2f}% vs prev close {_fmt_price(prev)})"
-        return ToolResult(ok=True, payload=f"{name} [{symbol}]: {_fmt_price(price)} {cur}{chg}")
+        payload = f"{name} [{symbol}]: {_fmt_price(price)} {cur}{chg}"
+        _cput(ckey, payload, ttl_s=120)
+        return ToolResult(ok=True, payload=payload)
 
 
 # ---- news ------------------------------------------------------------------

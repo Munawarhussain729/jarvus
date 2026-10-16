@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import threading
 import time
@@ -13,36 +14,120 @@ from app.voice.tts import TextToSpeech
 log = logging.getLogger("jarvus.voice.session")
 
 _SENTENCE_END_RE = re.compile(r"[.!?]+[\"')\]]*\s+|\n+")
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+# Prefixes of markup that must never reach TTS. A trailing partial match is
+# held back until the next delta proves or disproves it.
+_TAG_HEADS = ("<think>", "```", "<|", "[tool", "[security")
 
 
-class _SentenceStreamer:
-    """Feeds streamed LLM deltas to TTS one complete sentence at a time, so
-    speech starts while the model is still generating. Buffer is dropped if
-    the turn ends in tool calls instead of a spoken reply."""
+class _StreamSanitizer:
+    """Removes markup (<think> blocks, code fences, [tool]/[SECURITY] lines)
+    from a token stream *before* sentences are formed for TTS. Streaming-safe:
+    holds back a short trailing prefix that could complete into a tag opener."""
 
-    def __init__(self, speak):
-        self._speak = speak
+    def __init__(self) -> None:
+        self._raw = ""
+        self._emitted = 0
+
+    def _sanitized(self, final: bool) -> str:
+        t = _THINK_BLOCK_RE.sub("", self._raw)
+        t = _CODE_FENCE_RE.sub("", t)
+        if final:  # drop unclosed tail tags at end of round
+            t = re.sub(r"<think>.*", "", t, flags=re.DOTALL | re.IGNORECASE)
+            t = re.sub(r"```.*", "", t, flags=re.DOTALL)
+            t = re.sub(r"<\|.*", "", t, flags=re.DOTALL)
+        return t
+
+    def feed(self, delta: str) -> str:
+        self._raw += delta
+        t = self._sanitized(final=False)
+        safe = len(t)
+        i = self._emitted
+        while i < len(t):
+            # next markup-looking character after what we already emitted
+            idx = min((j for j in (t.find(m, i) for m in "<`[") if j != -1), default=len(t))
+            if idx >= len(t):
+                break
+            suffix = t[idx:]
+            hold = False
+            if suffix[:7].lower() == "<think>":
+                # unclosed think block: everything after is monologue, hold it all
+                if not re.search(r"</think\s*>", suffix, re.IGNORECASE):
+                    hold = True
+            elif suffix.startswith("```"):
+                if "```" not in suffix[3:]:
+                    hold = True  # unclosed fence
+            elif suffix.startswith("<|"):
+                hold = True  # <|im_start|>-style control token
+            elif len(suffix) < 10 and any(h.startswith(suffix) for h in _TAG_HEADS):
+                hold = True  # possible partial opener - wait for the rest
+            if hold:
+                safe = idx
+                break
+            i = idx + 1
+        out = t[self._emitted:safe]
+        self._emitted = safe
+        return out
+
+    def finish(self) -> str:
+        t = self._sanitized(final=True)
+        out = t[self._emitted:]
+        self._emitted = len(t)
+        return out
+
+
+class _SpeechPipeline:
+    """Bounded queue between LLM deltas and the speaker worker.
+
+    Solves three real bugs at once:
+    - the stream reader never blocks on TTS playback (a slow 'say' call no
+      longer stalls generation or drops the HTTP read timeout);
+    - markup is stripped before sentences form, so reasoning/code never leak
+      into speech, including tags split across streamed chunks;
+    - each sentence is deduplicated, so a nudged retry can't re-speak text the
+      user already heard.
+    """
+
+    MAX_QUEUE = 8
+
+    def __init__(self, session: "JarvusVoice") -> None:
+        self._session = session
+        self._san = _StreamSanitizer()
         self._buf = ""
         self.spoken = 0
+        self._seen: set[str] = set()
 
     def feed(self, delta: str) -> None:
-        self._buf += delta
+        self._buf += self._san.feed(delta)
         while True:
             m = _SENTENCE_END_RE.search(self._buf)
             if not m:
                 break
             sent, self._buf = self._buf[:m.end()], self._buf[m.end():]
-            sent = clean_for_speech(sent)
-            if sent:
-                self.spoken += 1
-                self._speak(sent)
+            self._enqueue(sent)
 
-    def flush(self) -> None:
-        rest = clean_for_speech(self._buf)
+    def discard_pending(self) -> None:
+        """Drop unsentenced text from an aborted round (tool calls coming)."""
         self._buf = ""
-        if rest:
-            self.spoken += 1
-            self._speak(rest)
+        self._san = _StreamSanitizer()
+
+    def _enqueue(self, text: str) -> None:
+        sent = clean_for_speech(text)
+        if not sent or sent in self._seen:
+            return
+        self._seen.add(sent)
+        self.spoken += 1
+        try:
+            self._session._speech_q.put_nowait(sent)
+        except queue.Full:
+            log.warning("speech queue full - dropping sentence")
+
+    def finish(self) -> None:
+        self._buf += self._san.finish()
+        if self._buf:
+            rest, self._buf = self._buf, ""
+            self._enqueue(rest)
 
 
 def clean_for_speech(text: str) -> str:
@@ -74,6 +159,33 @@ class JarvusVoice:
         self.auto_brief = auto_brief
         self.processing = threading.Event()
         self.listener.callback = self.handle_voice
+        self._speech_q: queue.Queue[str] = queue.Queue(maxsize=_SpeechPipeline.MAX_QUEUE)
+        self._speaker_stop = threading.Event()
+        self._speaker_thread: threading.Thread | None = None
+
+    def _speaker_loop(self) -> None:
+        """Serial TTS playback. Holds the mic drain (paused) across the whole
+        queue so echo between consecutive sentences can't reach the mic."""
+        while not self._speaker_stop.is_set():
+            try:
+                text = self._speech_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self.listener.paused.set()
+            self.listener.state = "speaking"
+            try:
+                self.tts.speak(text)
+                time.sleep(0.35)  # let room echo of the tail decay
+            finally:
+                self._speech_q.task_done()
+                if self._speech_q.empty():
+                    self.listener.paused.clear()
+                    self.listener.state = "idle"
+
+    def _ensure_speaker(self) -> None:
+        if self._speaker_thread is None or not self._speaker_thread.is_alive():
+            self._speaker_thread = threading.Thread(target=self._speaker_loop, daemon=True)
+            self._speaker_thread.start()
 
     def speak(self, text: str) -> None:
         clean = clean_for_speech(text)
@@ -90,31 +202,41 @@ class JarvusVoice:
         if self.processing.is_set():
             return
         self.processing.set()
+        self.listener.state = "processing"
         try:
             if not text:
                 self.speak("Yes?")
-                self.listener.expect_command.set()
+                self.listener.arm_followup()
                 return
             print(f"\nYou said: {text}")
             stt_ms = getattr(self.listener, "last_stt_ms", 0)
-            streamer = _SentenceStreamer(self.speak) if self.always_speak else None
+            pipe = _SpeechPipeline(self) if self.always_speak else None
+            if pipe:
+                self._ensure_speaker()
             t0 = time.monotonic()
             res = self.agent.process_user_text(
-                text, on_delta=streamer.feed if streamer else None)
+                text, on_delta=pipe.feed if pipe else None, speech=pipe)
             agent_ms = int((time.monotonic() - t0) * 1000)
             print(f"Jarvus: {res}\n")
             t1 = time.monotonic()
             if self.always_speak:
-                if streamer.spoken:
-                    streamer.flush()
+                if pipe.spoken:
+                    pipe.finish()
+                    self._speech_q.join()  # wait for serial playback to drain
                 else:
                     self.speak(res)
-            log.info("turn_timing stt_ms=%d agent_ms=%d tts_ms=%d",
-                     stt_ms, agent_ms, int((time.monotonic() - t1) * 1000))
+            tts_ms = int((time.monotonic() - t1) * 1000)
+            log.info("turn_timing stt_ms=%d agent_ms=%d tts_ms=%d", stt_ms, agent_ms, tts_ms)
+            try:
+                from app.telemetry import record
+                record("turn", stt_ms=stt_ms, agent_ms=agent_ms, tts_ms=tts_ms)
+            except Exception:
+                pass
             # Jarvus asked a question - take the next utterance as the answer
-            # even without the wake word, so follow-ups aren't dropped.
+            # even without the wake word, so follow-ups aren't dropped (expiry
+            # prevents a stale arm from swallowing a later utterance).
             if res.strip().endswith("?"):
-                self.listener.expect_command.set()
+                self.listener.arm_followup()
         except Exception as e:
             log.exception("voice turn failed")
             print(f"Error: {e}")
@@ -126,6 +248,7 @@ class JarvusVoice:
     def voice_confirmer(self, tool_name: str, summary: str) -> bool:
         """Ask the user by voice to confirm a HIGH-risk tool. Runs on the agent worker thread."""
         self.listener.paused.set()
+        self.listener.state = "confirming"
         try:
             self.tts.speak(f"Jarvus requests {tool_name.replace('_', ' ')}. Say yes to confirm, or anything else to cancel.")
             time.sleep(0.3)
@@ -149,8 +272,15 @@ class JarvusVoice:
             return approved
         finally:
             self.listener.paused.clear()
+            self.listener.state = "idle"
+
+    def stop(self) -> None:
+        self._speaker_stop.set()
+        if self._speaker_thread:
+            self._speaker_thread.join(timeout=2)
 
     def start(self) -> None:
+        self._ensure_speaker()
         self.speak("Jarvus is online.")
         if self.auto_brief:
             from app.tools.briefing import maybe_auto_brief
@@ -158,4 +288,5 @@ class JarvusVoice:
             if digest:
                 self.speak(digest)
         self.listener.paused.clear()
+        self.listener.state = "listening"
         self.listener.start()
