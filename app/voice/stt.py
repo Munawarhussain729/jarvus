@@ -5,6 +5,7 @@ import logging
 import platform
 import re
 import threading
+import zlib
 from typing import Protocol
 
 import numpy as np
@@ -22,12 +23,49 @@ _HALLUCINATIONS = {
     "see you", "see you next time", "all right", "alright", "hmm", "mhm",
     "um", "uh", "so", "you", "like and subscribe", "subscribe",
     "subtitles by", "amaraorg", "please subscribe", "copyright",
+    "here we go", "like that", "there you go", "youre welcome",
+    "take care", "stay safe", "see ya", "see you later", "have a good day",
+    "have a nice day", "lets go", "come on", "hold on",
 }
+
+# Whisper's own decode-failure bounds: below _MIN_AVG_LOGPROB the model is
+# guessing at noise; above _MAX_COMPRESSION_RATIO the decoder looped on a
+# repeated phrase (the classic "this link to find all of this link ..." spam).
+_MIN_AVG_LOGPROB = -1.0
+_MAX_COMPRESSION_RATIO = 2.4
+
+
+def _compression_ratio(text: str) -> float:
+    raw = text.encode("utf-8")
+    if not raw:
+        return 0.0
+    return len(raw) / max(len(zlib.compress(raw)), 1)
+
+
+def _is_repetitive(text: str) -> bool:
+    """Decoder-loop fingerprint: a long transcript built from a tiny vocabulary."""
+    words = re.sub(r"[^a-z ]", " ", text.lower()).split()
+    return len(words) >= 10 and len(set(words)) / len(words) < 0.4
 
 
 def _is_hallucination(text: str) -> bool:
     t = re.sub(r"[^a-z ]", "", text.lower()).strip()
-    return not t or t in _HALLUCINATIONS
+    if not t or t in _HALLUCINATIONS:
+        return True
+    return _is_repetitive(text) or _compression_ratio(t) > _MAX_COMPRESSION_RATIO
+
+
+def _keep_segment(seg: dict, *, no_speech_threshold: float = 0.6,
+                  min_logprob: float = _MIN_AVG_LOGPROB) -> bool:
+    """Per-segment filter using whisper's decoder confidence signals."""
+    if seg.get("no_speech_prob", 0.0) > no_speech_threshold:
+        return False
+    if seg.get("avg_logprob", 0.0) < min_logprob:
+        return False
+    ratio = seg.get("compression_ratio")
+    if ratio is None:
+        ratio = _compression_ratio(seg.get("text") or "")
+    return ratio <= _MAX_COMPRESSION_RATIO
 
 
 # Bias whisper toward the assistant's vocabulary so commands land correctly.
@@ -66,9 +104,12 @@ class MLXWhisperSTT:
 
     name = "mlx-whisper"
 
-    def __init__(self, model: str = "turbo") -> None:
+    def __init__(self, model: str = "turbo", *, no_speech_threshold: float = 0.6,
+                 min_logprob: float = _MIN_AVG_LOGPROB) -> None:
         import mlx_whisper  # noqa: F401
         self._model = model if "/" in model else MLX_MODELS.get(model, f"mlx-community/whisper-{model}-mlx")
+        self._no_speech = no_speech_threshold
+        self._min_logprob = min_logprob
         log.info("MLX-whisper STT ready (%s)", self._model)
 
     def transcribe(self, audio_f32: np.ndarray) -> str:
@@ -78,14 +119,18 @@ class MLXWhisperSTT:
             path_or_hf_repo=self._model,
             condition_on_previous_text=False,
             initial_prompt=HOTWORDS_PROMPT,
-            no_speech_threshold=0.6,
+            no_speech_threshold=self._no_speech,
         )
-        # Drop segments the decoder itself flags as non-speech - this is where
-        # silence hallucinations ('Thank you.') come from.
+        # Drop segments the decoder itself flags as non-speech, low-confidence,
+        # or looped - this is where silence/noise hallucinations come from.
         segments = result.get("segments") or []
-        if segments and all(s.get("no_speech_prob", 0.0) > 0.6 for s in segments):
-            return ""
-        text = (result.get("text") or "").strip()
+        if segments:
+            text = " ".join(
+                s.get("text", "").strip() for s in segments
+                if _keep_segment(s, no_speech_threshold=self._no_speech, min_logprob=self._min_logprob)
+            ).strip()
+        else:
+            text = (result.get("text") or "").strip()
         return "" if _is_hallucination(text) else text
 
 
@@ -94,21 +139,32 @@ class FasterWhisperSTT:
 
     name = "faster-whisper"
 
-    def __init__(self, model: str = "small") -> None:
+    def __init__(self, model: str = "small", *, no_speech_threshold: float = 0.6,
+                 min_logprob: float = _MIN_AVG_LOGPROB) -> None:
         from faster_whisper import WhisperModel
         size = model if "/" not in model else model.rsplit("/", 1)[-1]
         if size in ("turbo", "large-v3-turbo"):
             size = "large-v3"
         self._model = WhisperModel(size, device="cpu", compute_type="int8")
+        self._no_speech = no_speech_threshold
+        self._min_logprob = min_logprob
 
     def transcribe(self, audio_f32: np.ndarray) -> str:
         segments, _ = self._model.transcribe(
             audio_f32, beam_size=1, vad_filter=True, initial_prompt=HOTWORDS_PROMPT
         )
         segs = list(segments)
-        if segs and all(getattr(s, "no_speech_prob", 0.0) > 0.6 for s in segs):
-            return ""
-        text = " ".join(seg.text.strip() for seg in segs).strip()
+        kept = []
+        for s in segs:
+            d = {
+                "no_speech_prob": getattr(s, "no_speech_prob", 0.0),
+                "avg_logprob": getattr(s, "avg_logprob", 0.0),
+                "compression_ratio": _compression_ratio(getattr(s, "text", "") or ""),
+                "text": getattr(s, "text", ""),
+            }
+            if _keep_segment(d, no_speech_threshold=self._no_speech, min_logprob=self._min_logprob):
+                kept.append(d["text"])
+        text = " ".join(t.strip() for t in kept).strip()
         return "" if _is_hallucination(text) else text
 
 
@@ -116,7 +172,9 @@ _lock = threading.Lock()
 _engine: SpeechToText | None = None
 
 
-def get_stt(engine: str = "auto", model: str = "turbo") -> SpeechToText:
+def get_stt(engine: str = "auto", model: str = "turbo", *,
+            no_speech_threshold: float = 0.6,
+            min_logprob: float = _MIN_AVG_LOGPROB) -> SpeechToText:
     """Pick the best available local STT engine."""
     global _engine
     with _lock:
@@ -131,7 +189,7 @@ def get_stt(engine: str = "auto", model: str = "turbo") -> SpeechToText:
             candidates.append(MLXWhisperSTT)
         for cls in candidates:
             try:
-                _engine = cls(model)
+                _engine = cls(model, no_speech_threshold=no_speech_threshold, min_logprob=min_logprob)
                 return _engine
             except Exception as e:
                 log.warning("STT engine %s unavailable: %s", cls.__name__, e)

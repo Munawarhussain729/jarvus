@@ -12,6 +12,38 @@ from app.voice.tts import TextToSpeech
 
 log = logging.getLogger("jarvus.voice.session")
 
+_SENTENCE_END_RE = re.compile(r"[.!?]+[\"')\]]*\s+|\n+")
+
+
+class _SentenceStreamer:
+    """Feeds streamed LLM deltas to TTS one complete sentence at a time, so
+    speech starts while the model is still generating. Buffer is dropped if
+    the turn ends in tool calls instead of a spoken reply."""
+
+    def __init__(self, speak):
+        self._speak = speak
+        self._buf = ""
+        self.spoken = 0
+
+    def feed(self, delta: str) -> None:
+        self._buf += delta
+        while True:
+            m = _SENTENCE_END_RE.search(self._buf)
+            if not m:
+                break
+            sent, self._buf = self._buf[:m.end()], self._buf[m.end():]
+            sent = clean_for_speech(sent)
+            if sent:
+                self.spoken += 1
+                self._speak(sent)
+
+    def flush(self) -> None:
+        rest = clean_for_speech(self._buf)
+        self._buf = ""
+        if rest:
+            self.spoken += 1
+            self._speak(rest)
+
 
 def clean_for_speech(text: str) -> str:
     text = re.sub(r'\[tool.*?\]', '', text, flags=re.IGNORECASE)
@@ -64,10 +96,21 @@ class JarvusVoice:
                 self.listener.expect_command.set()
                 return
             print(f"\nYou said: {text}")
-            res = self.agent.process_user_text(text)
+            stt_ms = getattr(self.listener, "last_stt_ms", 0)
+            streamer = _SentenceStreamer(self.speak) if self.always_speak else None
+            t0 = time.monotonic()
+            res = self.agent.process_user_text(
+                text, on_delta=streamer.feed if streamer else None)
+            agent_ms = int((time.monotonic() - t0) * 1000)
             print(f"Jarvus: {res}\n")
+            t1 = time.monotonic()
             if self.always_speak:
-                self.speak(res)
+                if streamer.spoken:
+                    streamer.flush()
+                else:
+                    self.speak(res)
+            log.info("turn_timing stt_ms=%d agent_ms=%d tts_ms=%d",
+                     stt_ms, agent_ms, int((time.monotonic() - t1) * 1000))
             # Jarvus asked a question - take the next utterance as the answer
             # even without the wake word, so follow-ups aren't dropped.
             if res.strip().endswith("?"):

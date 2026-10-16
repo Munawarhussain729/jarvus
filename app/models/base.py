@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -30,5 +30,11 @@ class ModelProvider(ABC):
         system_prompt: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
-        """Call remote or local model; must not execute tools."""
+        """Call remote or local model; must not execute tools.
+
+        on_delta (optional): receives content text chunks as they stream in,
+        so voice mode can start speaking the first sentence while the rest
+        generates. Providers without streaming support may ignore it.
+        """

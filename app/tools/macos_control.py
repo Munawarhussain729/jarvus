@@ -20,7 +20,7 @@ class VolumeTool(Tool):
         parameters_schema={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["get", "set", "mute", "unmute"], "default": "get"},
+                "action": {"type": "string", "enum": ["get", "set", "up", "down", "mute", "unmute"], "default": "get"},
                 "level": {"type": "integer", "minimum": 0, "maximum": 100},
             },
             "required": ["action"],
@@ -33,6 +33,18 @@ class VolumeTool(Tool):
         action = arguments.get("action", "get")
         if action == "get":
             return run('output volume of (get volume settings)')
+        if action in ("up", "down"):
+            cur = run('output volume of (get volume settings)')
+            m = re.search(r"\d+", cur.payload or "")
+            if not m:
+                return ToolResult(ok=False, payload="could not read current volume")
+            step = 10
+            try:
+                step = max(1, min(50, int(arguments.get("level") or 10)))
+            except (TypeError, ValueError):
+                pass
+            target = max(0, min(100, int(m.group(0)) + (step if action == "up" else -step)))
+            return run(f"set volume output volume {target}", ok_payload=f"Volume {action} to {target}")
         if action == "set":
             try:
                 level = max(0, min(100, int(arguments.get("level", 50))))

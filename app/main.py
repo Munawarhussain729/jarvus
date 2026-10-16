@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 import time
 
 from app.bootstrap import build_agent
@@ -61,6 +62,9 @@ def _run_voice(settings, agent, *, wake_word: bool, speak: bool, auto_brief: boo
         use_wake_word=wake_word,
         stt_engine=settings.stt_engine,
         stt_model=settings.stt_model,
+        stt_no_speech_threshold=settings.stt_no_speech_threshold,
+        stt_min_logprob=settings.stt_min_logprob,
+        silence_rms=settings.stt_silence_rms,
     )
     voice = JarvusVoice(agent, listener=listener, tts=tts, always_speak=speak, auto_brief=auto_brief)
     # Route HIGH-risk confirmations through voice instead of stdin (local runs only).
@@ -121,6 +125,17 @@ def main() -> None:
         )
         print(f"Model: {args.model or (settings.model if args.openai else settings.llm_model)}"
               f"{' (openai)' if args.openai else ' (local)'} | DB: {settings.resolved_db_path()}")
+        # Warm the model on a background thread while STT/TTS load - the first
+        # command shouldn't pay a 30-60s model-load penalty. Voice sessions pin
+        # the model in RAM longer between commands.
+        prov = getattr(agent, "_provider", None)
+        warmup = getattr(prov, "warmup", None)
+        if callable(warmup):
+            threading.Thread(
+                target=warmup,
+                kwargs={"keep_alive": "60m"} if args.voice else {},
+                daemon=True,
+            ).start()
 
     auto_brief = settings.auto_brief.lower() == "on" or (
         settings.auto_brief.lower() == "auto" and args.voice

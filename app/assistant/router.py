@@ -69,7 +69,13 @@ class ToolRouter:
                     detail={"phase": "parse"},
                 )
             )
-            return f"[tool error] {e}"
+            # Echo the expected schema back so the model can self-repair the
+            # call on the next round instead of repeating the same bad JSON.
+            hint = ""
+            tool = self._registry.get(tool_name)
+            if tool is not None:
+                hint = f" Expected arguments schema: {json.dumps(tool.spec.parameters_schema)[:600]}"
+            return f"[tool error] {e}.{hint} Retry the tool call with corrected arguments."
 
         tool = self._registry.get(tool_name)
         if tool is None:

@@ -31,13 +31,18 @@ class Settings(BaseSettings):
 
     # Local LLM (Ollama native API preferred; any OpenAI-compatible base URL works)
     llm_base_url: str = Field(default="http://localhost:11434")
-    llm_model: str = Field(default="qwen3:8b")
+    llm_model: str = Field(default="qwen3:4b-instruct-2507-q4_K_M")  # instruct (non-thinking) - fast tool use
     llm_num_ctx: int = Field(default=16384)
     llm_think: bool = Field(default=False)  # qwen3-style thinking; off for voice latency
+    llm_keep_alive: str = Field(default="30m")  # Ollama model residency; lower frees RAM sooner
 
     # Voice pipeline
     stt_engine: str = Field(default="auto")  # auto | mlx | faster-whisper
-    stt_model: str = Field(default="turbo")  # turbo|small|medium|tiny|base|large or mlx repo id
+    stt_model: str = Field(default="small")  # small|turbo|medium|tiny|base|large or mlx repo id
+    # Hallucination gates: raise for noisy rooms (drop more), lower for soft mics
+    stt_no_speech_threshold: float = Field(default=0.6)  # drop segments above this no_speech_prob
+    stt_min_logprob: float = Field(default=-1.0)  # drop segments below this avg_logprob
+    stt_silence_rms: float = Field(default=0.003)  # skip whisper entirely below this audio RMS
     tts_engine: str = Field(default="auto")  # auto | kokoro | say
     tts_voice: str = Field(default="af_heart")  # kokoro voice id or macOS voice name
     tts_rate: int = Field(default=200)  # 'say' words-per-minute
