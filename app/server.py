@@ -118,7 +118,7 @@ class RemoteJarvus:
             self._client = httpx.Client(base_url=self._url, headers=headers, timeout=300.0)
         return self._client
 
-    def process_user_text(self, text: str, *, on_delta=None) -> str:
+    def process_user_text(self, text: str, *, on_delta=None, speech=None) -> str:
         r = self._http().post("/chat", json={"text": text})
         r.raise_for_status()
         return str(r.json().get("reply", ""))

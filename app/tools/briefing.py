@@ -14,10 +14,21 @@ from app.security.policy import RiskLevel
 from app.tools.base import Tool, ToolResult, ToolSpec
 
 
+def _fetch_weather() -> str | None:
+    """Short weather line for the morning brief; None when unreachable."""
+    try:
+        from app.tools.weather import WeatherTool
+        res = WeatherTool().run({"city": "", "format": "short"})
+        return res.payload if res.ok and res.payload else None
+    except Exception:
+        return None
+
+
 def _default_reads() -> dict[str, Callable]:
     from app.tools.reminders import fetch_calendar_events, fetch_open_reminders, day_bounds
 
-    return {"reminders": fetch_open_reminders, "events": fetch_calendar_events, "bounds": day_bounds}
+    return {"reminders": fetch_open_reminders, "events": fetch_calendar_events,
+            "bounds": day_bounds, "weather": _fetch_weather}
 
 
 def _recent_notes(n: int = 3) -> list[str]:
@@ -55,6 +66,14 @@ def gather_day_digest(memory=None, read_fns: dict[str, Callable] | None = None) 
     todos = memory.list_todos() if memory is not None else []
 
     parts: list[str] = []
+    weather_fn = fns.get("weather")
+    if weather_fn:
+        try:
+            weather = weather_fn()
+        except Exception:
+            weather = None
+        if weather:
+            parts.append(weather.rstrip(".") if len(weather) < 160 else weather[:160])
     if events:
         events.sort(key=lambda e: (e["start"] is None, e["start"] or datetime.max))
         first = events[0]

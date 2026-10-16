@@ -80,7 +80,7 @@ class LocalProvider(ModelProvider):
         self,
         *,
         base_url: str = "http://localhost:11434",
-        model: str = "qwen3:4b-instruct-2507",
+        model: str = "qwen3:4b-instruct-2507-q4_K_M",
         temperature: float = 0.2,
         max_tokens: int = 512,
         num_ctx: int = 16384,
@@ -131,7 +131,9 @@ class LocalProvider(ModelProvider):
             "stream": False,
             "think": False,
             "keep_alive": self._keep_alive,
-            "options": {"temperature": 0.0, "num_predict": 8, "num_ctx": 2048},
+            # Warm with the real context size so the first command doesn't pay
+            # for a context-window reallocation.
+            "options": {"temperature": 0.0, "num_predict": 8, "num_ctx": self._num_ctx},
         }
         try:
             t0 = time.monotonic()
@@ -162,11 +164,13 @@ class LocalProvider(ModelProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         on_delta: Callable[[str], None] | None = None,
+        max_tokens: int | None = None,
     ) -> AssistantTurn:
         api_messages = [{"role": "system", "content": system_prompt}] + messages
         if self._detect_backend():
-            return self._generate_ollama(self._to_native_history(api_messages), tools, on_delta=on_delta)
-        return self._generate_openai_compat(api_messages, tools)
+            return self._generate_ollama(self._to_native_history(api_messages), tools,
+                                         on_delta=on_delta, max_tokens=max_tokens)
+        return self._generate_openai_compat(api_messages, tools, max_tokens=max_tokens)
 
     @staticmethod
     def _to_native_history(api_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -192,7 +196,8 @@ class LocalProvider(ModelProvider):
     _TIMEOUT_REPLY = "[Jarvus] That's taking too long - the model timed out. Try a shorter request."
 
     def _generate_ollama(self, api_messages: list[dict[str, Any]], tools,
-                         *, on_delta: Callable[[str], None] | None = None) -> AssistantTurn:
+                         *, on_delta: Callable[[str], None] | None = None,
+                         max_tokens: int | None = None) -> AssistantTurn:
         import httpx
         payload: dict[str, Any] = {
             "model": self._model,
@@ -202,7 +207,7 @@ class LocalProvider(ModelProvider):
             "keep_alive": self._keep_alive,
             "options": {
                 "temperature": self._temperature,
-                "num_predict": self._max_tokens,
+                "num_predict": max_tokens or self._max_tokens,
                 "num_ctx": self._num_ctx,
                 "top_p": 0.9,
             },
@@ -232,12 +237,19 @@ class LocalProvider(ModelProvider):
     def _ollama_stream(self, payload: dict[str, Any],
                        on_delta: Callable[[str], None]) -> AssistantTurn:
         """Streaming /api/chat: speakable text flows to on_delta per chunk while
-        tool_calls still land in the final message."""
+        tool_calls still land in the final message. An overall deadline caps the
+        stream - httpx's read timeout only covers stalls between chunks."""
         content_parts: list[str] = []
         tool_calls: list[ToolCall] = []
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        timed_out = False
         with self._client().stream("POST", f"{self._base}/api/chat", json=payload) as r:
             r.raise_for_status()
             for line in r.iter_lines():
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    log.warning("LLM stream exceeded %.0fs deadline - closing", REQUEST_TIMEOUT)
+                    break
                 if not line:
                     continue
                 try:
@@ -251,10 +263,13 @@ class LocalProvider(ModelProvider):
                     on_delta(delta)
                 if msg.get("tool_calls"):
                     tool_calls = _collect_tool_calls(msg)
+        if timed_out and not content_parts and not tool_calls:
+            return AssistantTurn(content=self._TIMEOUT_REPLY, tool_calls=[])
         return AssistantTurn(content=clean_content("".join(content_parts)),
                              tool_calls=tool_calls)
 
-    def _generate_openai_compat(self, api_messages: list[dict[str, Any]], tools) -> AssistantTurn:
+    def _generate_openai_compat(self, api_messages: list[dict[str, Any]], tools,
+                                *, max_tokens: int | None = None) -> AssistantTurn:
         try:
             from openai import OpenAI
         except Exception:
@@ -266,7 +281,7 @@ class LocalProvider(ModelProvider):
             "model": self._model,
             "messages": api_messages,
             "temperature": self._temperature,
-            "max_tokens": self._max_tokens,
+            "max_tokens": max_tokens or self._max_tokens,
         }
         if tools:
             kwargs["tools"] = tools

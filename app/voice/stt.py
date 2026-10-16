@@ -55,6 +55,25 @@ def _is_hallucination(text: str) -> bool:
     return _is_repetitive(text) or _compression_ratio(t) > _MAX_COMPRESSION_RATIO
 
 
+def has_speech(audio_f32: np.ndarray, *, rms_gate: float = 0.003,
+               min_voiced_frac: float = 0.12, frame_ms: int = 50) -> bool:
+    """Cheap VAD before paying whisper inference.
+
+    Overall-RMS alone passes on one loud click; requiring a minimum fraction of
+    50ms frames above the gate rejects clicks/thumps while keeping real speech
+    (which has pauses but sustained voiced regions)."""
+    if not audio_f32.size:
+        return False
+    frame = max(1, int(SAMPLE_RATE * frame_ms / 1000))
+    n_frames = audio_f32.size // frame
+    if n_frames < 2:
+        # Very short chunk: fall back to plain RMS.
+        return float(np.sqrt(np.mean(audio_f32 * audio_f32))) >= rms_gate
+    framed = audio_f32[: n_frames * frame].reshape(n_frames, frame)
+    rms = np.sqrt(np.mean(framed * framed, axis=1))
+    return float(np.mean(rms >= rms_gate)) >= min_voiced_frac
+
+
 def _keep_segment(seg: dict, *, no_speech_threshold: float = 0.6,
                   min_logprob: float = _MIN_AVG_LOGPROB) -> bool:
     """Per-segment filter using whisper's decoder confidence signals."""

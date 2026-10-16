@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # Local LLM (Ollama native API preferred; any OpenAI-compatible base URL works)
     llm_base_url: str = Field(default="http://localhost:11434")
     llm_model: str = Field(default="qwen3:4b-instruct-2507-q4_K_M")  # instruct (non-thinking) - fast tool use
-    llm_num_ctx: int = Field(default=16384)
+    llm_num_ctx: int = Field(default=8192)  # fits 16GB Macs; raise via JARVUS_PROFILE=coding
     llm_think: bool = Field(default=False)  # qwen3-style thinking; off for voice latency
     llm_keep_alive: str = Field(default="30m")  # Ollama model residency; lower frees RAM sooner
 
@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     auto_brief: str = Field(default="auto")
     # Heuristic tool-payload prefilter (off = always send all schemas)
     tool_prefilter: bool = Field(default=True)
+    # Named preset for context/generation/memory budgets: lean | balanced | coding.
+    # Individual JARVUS_* vars always win over the profile.
+    profile: str = Field(default="balanced")
 
     # Remote access server (POST /chat)
     server_host: str = Field(default="127.0.0.1")
@@ -95,5 +98,34 @@ class Settings(BaseSettings):
         )
 
 
+# Budget presets - JARVUS_PROFILE selects one; any explicit JARVUS_* var wins.
+_PROFILES: dict[str, dict[str, object]] = {
+    "lean":     {"llm_num_ctx": 8192,  "max_tokens": 256,  "stt_model": "small", "llm_keep_alive": "10m"},
+    "balanced": {"llm_num_ctx": 8192,  "max_tokens": 384,  "stt_model": "small", "llm_keep_alive": "30m"},
+    "coding":   {"llm_num_ctx": 16384, "max_tokens": 1024, "stt_model": "small", "llm_keep_alive": "60m"},
+}
+
+
+def _explicit_env_keys() -> set[str]:
+    """JARVUS_* names the user set explicitly - in the process env or .env."""
+    keys = {k for k in os.environ if k.startswith("JARVUS_")}
+    try:
+        for line in Path(".env").read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                keys.add(line.split("=", 1)[0].strip())
+    except OSError:
+        pass
+    return keys
+
+
 def load_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    prof = str(s.profile).lower()
+    cfg = _PROFILES.get(prof)
+    if cfg:
+        explicit = _explicit_env_keys()
+        for field, val in cfg.items():
+            if f"JARVUS_{field.upper()}" not in explicit:
+                setattr(s, field, val)
+    return s

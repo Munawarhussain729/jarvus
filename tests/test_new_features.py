@@ -445,7 +445,17 @@ class TestCreateCodeTool:
         import app.tools.code as code_mod
         monkeypatch.setattr(code_mod, "PROJECTS_DIR", tmp_path)
         r = code_mod.CreateCodeTool().run({"filename": "bad.py", "code": "def broken(:\n"})
-        assert not r.ok and "syntax error" in r.payload
+        assert not r.ok and "syntax error" in r.payload.lower()
+        assert not (tmp_path / "bad.py").exists()  # bad code never touches disk
+
+    def test_bad_code_does_not_clobber_existing(self, tmp_path, monkeypatch):
+        import app.tools.code as code_mod
+        monkeypatch.setattr(code_mod, "PROJECTS_DIR", tmp_path)
+        good = code_mod.CreateCodeTool().run({"filename": "keep.py", "code": "x = 1\n"})
+        assert good.ok
+        bad = code_mod.CreateCodeTool().run({"filename": "keep.py", "code": "def broken(:\n"})
+        assert not bad.ok
+        assert (tmp_path / "keep.py").read_text() == "x = 1\n"
 
     def test_path_traversal_stripped(self, tmp_path, monkeypatch):
         import app.tools.code as code_mod
@@ -455,25 +465,172 @@ class TestCreateCodeTool:
         assert (tmp_path / "evil.py").exists()
 
 
-class TestSentenceStreamer:
+class _FakeListener:
+    def __init__(self):
+        import threading
+        self.paused = threading.Event()
+        self.state = "idle"
+
+
+class _FakeTTS:
+    def __init__(self):
+        self.spoken: list[str] = []
+
+    def speak(self, text):
+        self.spoken.append(text)
+
+
+def _make_session():
+    from app.voice.session import JarvusVoice
+    v = JarvusVoice.__new__(JarvusVoice)
+    v.tts = _FakeTTS()
+    v.listener = _FakeListener()
+    import queue, threading
+    v._speech_q = queue.Queue(maxsize=8)
+    v._speaker_stop = threading.Event()
+    v._speaker_thread = None
+    v._ensure_speaker()
+    return v
+
+
+class TestSpeechPipeline:
     def test_sentences_emitted_incrementally(self):
-        from app.voice.session import _SentenceStreamer
-        out = []
-        s = _SentenceStreamer(out.append)
-        s.feed("Saved the file. It")
-        assert out == ["Saved the file."]
-        s.feed(" has two parts.")
-        assert out == ["Saved the file."]  # no trailing boundary yet
-        s.flush()
-        assert out == ["Saved the file.", "It has two parts."]
+        from app.voice.session import _SpeechPipeline
+        sess = _make_session()
+        p = _SpeechPipeline(sess)
+        p.feed("Saved the file. It")
+        p.feed(" has two parts.")
+        p.finish()
+        sess._speech_q.join()
+        assert sess.tts.spoken == ["Saved the file.", "It has two parts."]
+        sess._speaker_stop.set()
 
     def test_flush_speaks_remainder(self):
-        from app.voice.session import _SentenceStreamer
-        out = []
-        s = _SentenceStreamer(out.append)
-        s.feed("All done")
-        s.flush()
-        assert out == ["All done"]
+        from app.voice.session import _SpeechPipeline
+        sess = _make_session()
+        p = _SpeechPipeline(sess)
+        p.feed("All done")
+        p.finish()
+        sess._speech_q.join()
+        assert sess.tts.spoken == ["All done"]
+        sess._speaker_stop.set()
+
+    def test_think_block_never_spoken_even_when_split(self):
+        from app.voice.session import _SpeechPipeline
+        sess = _make_session()
+        p = _SpeechPipeline(sess)
+        p.feed("<thi")      # partial tag - must be held back
+        p.feed("nk>secret monologue</thi")
+        p.feed("nk>Done. ")
+        p.finish()
+        sess._speech_q.join()
+        assert sess.tts.spoken == ["Done."]
+        sess._speaker_stop.set()
+
+    def test_unclosed_think_dropped_at_finish(self):
+        from app.voice.session import _SpeechPipeline
+        sess = _make_session()
+        p = _SpeechPipeline(sess)
+        p.feed("Working. <think> hmm the user")
+        p.finish()
+        sess._speech_q.join()
+        assert sess.tts.spoken == ["Working."]
+        sess._speaker_stop.set()
+
+    def test_no_duplicate_speech_on_retry(self):
+        from app.voice.session import _SpeechPipeline
+        sess = _make_session()
+        p = _SpeechPipeline(sess)
+        p.feed("Done. ")
+        p.feed("Done. Again. ")
+        p.finish()
+        sess._speech_q.join()
+        assert sess.tts.spoken == ["Done.", "Again."]
+        sess._speaker_stop.set()
+
+    def test_discard_pending_drops_partial(self):
+        from app.voice.session import _SpeechPipeline
+        sess = _make_session()
+        p = _SpeechPipeline(sess)
+        p.feed("Let me create th")   # no sentence end - pending
+        p.discard_pending()
+        p.feed("File saved. ")
+        p.finish()
+        sess._speech_q.join()
+        assert sess.tts.spoken == ["File saved."]
+        sess._speaker_stop.set()
+
+
+class TestVAD:
+    def test_silence_and_click_rejected(self):
+        import numpy as np
+        from app.voice.stt import has_speech, SAMPLE_RATE
+        rng = np.random.default_rng(0)
+        silence = rng.normal(0, 0.0005, SAMPLE_RATE).astype(np.float32)
+        assert not has_speech(silence, rms_gate=0.003)
+        click = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        click[4000:4800] = 0.3  # loud transient < 12% of frames
+        assert not has_speech(click, rms_gate=0.003)
+
+    def test_voiced_audio_passes(self):
+        import numpy as np
+        from app.voice.stt import has_speech, SAMPLE_RATE
+        voiced = np.tile(np.random.default_rng(1).normal(0, 0.02, int(SAMPLE_RATE * .3)),
+                         4)[:SAMPLE_RATE].astype(np.float32)
+        assert has_speech(voiced, rms_gate=0.003)
+
+
+class TestSchemaValidation:
+    def _router(self):
+        from app.assistant.router import ToolRouter
+        from app.tools.registry import ToolRegistry
+        from app.audit.logger import AuditLogger
+        from app.memory.store import MemoryStore
+        from pathlib import Path
+        import tempfile
+        from app.tools.weather import WeatherTool
+        reg = ToolRegistry([WeatherTool()])
+        mem = MemoryStore(Path(tempfile.mkdtemp()) / "m.db")
+        return ToolRouter(reg, AuditLogger(mem), confirmer=lambda n, s: True)
+
+    def test_bad_enum_rejected_with_schema(self):
+        r = self._router()
+        body = r.handle_tool_call(tool_name="weather", arguments_json='{"format": "banana"}')
+        assert "[tool error]" in body and "enum" in body.lower() or "one of" in body
+
+    def test_wrong_type_rejected(self):
+        r = self._router()
+        body = r.handle_tool_call(tool_name="weather", arguments_json='{"city": 42}')
+        assert "[tool error]" in body
+
+    def test_valid_args_pass(self, monkeypatch):
+        import app.tools.weather as w
+        monkeypatch.setattr(w.WeatherTool, "run", lambda self, a: type("R", (), {"ok": True, "payload": "ok", "detail": {}})())
+        r = self._router()
+        body = r.handle_tool_call(tool_name="weather", arguments_json='{"city": "Paris"}')
+        assert "[tool ok]" in body
+
+
+class TestProfiles:
+    def test_lean_profile_applies(self, monkeypatch, tmp_path):
+        # Run in a dir with no .env so only monkeypatched env vars count.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("JARVUS_PROFILE", "lean")
+        monkeypatch.delenv("JARVUS_LLM_NUM_CTX", raising=False)
+        monkeypatch.delenv("JARVUS_MAX_TOKENS", raising=False)
+        monkeypatch.delenv("JARVUS_LLM_KEEP_ALIVE", raising=False)
+        monkeypatch.delenv("JARVUS_STT_MODEL", raising=False)
+        from app.config import load_settings
+        s = load_settings()
+        assert s.max_tokens == 256 and s.llm_num_ctx == 8192
+
+    def test_explicit_var_beats_profile(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("JARVUS_PROFILE", "lean")
+        monkeypatch.setenv("JARVUS_MAX_TOKENS", "999")
+        from app.config import load_settings
+        s = load_settings()
+        assert s.max_tokens == 999
 
 
 class TestNewIntents:
