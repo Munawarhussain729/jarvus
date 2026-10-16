@@ -409,3 +409,97 @@ class TestToolPrefilter:
         # cached payload returns fresh lists - mutating one doesn't corrupt cache
         sub.append({"x": 1})
         assert len(reg.openai_tools_payload()) == len(full)
+
+
+class TestContentCleaning:
+    """Provider-side safety net: think blocks and leaked reasoning never reach speech."""
+
+    def test_think_block_stripped(self):
+        from app.models.local_provider import clean_content
+        assert clean_content("<think>long reasoning</think>Done, saved it.") == "Done, saved it."
+
+    def test_unclosed_think_drops_tail(self):
+        from app.models.local_provider import clean_content
+        assert clean_content("<think>still reasoning") == ""
+
+    def test_reasoning_leak_becomes_empty(self):
+        from app.models.local_provider import clean_content
+        assert clean_content("Hmm, the user wants me to say OK. I need to") == ""
+        assert clean_content("The user asked me to make a game.") == ""
+
+    def test_normal_reply_untouched(self):
+        from app.models.local_provider import clean_content
+        assert clean_content("Sure, your file is saved.") == "Sure, your file is saved."
+        assert clean_content(None) is None
+
+
+class TestCreateCodeTool:
+    def test_writes_and_checks_python(self, tmp_path, monkeypatch):
+        import app.tools.code as code_mod
+        monkeypatch.setattr(code_mod, "PROJECTS_DIR", tmp_path)
+        r = code_mod.CreateCodeTool().run({"filename": "snake.py", "code": "x = 1\nprint(x)\n"})
+        assert r.ok and "syntax OK" in r.payload
+        assert (tmp_path / "snake.py").exists()
+
+    def test_syntax_error_reported(self, tmp_path, monkeypatch):
+        import app.tools.code as code_mod
+        monkeypatch.setattr(code_mod, "PROJECTS_DIR", tmp_path)
+        r = code_mod.CreateCodeTool().run({"filename": "bad.py", "code": "def broken(:\n"})
+        assert not r.ok and "syntax error" in r.payload
+
+    def test_path_traversal_stripped(self, tmp_path, monkeypatch):
+        import app.tools.code as code_mod
+        monkeypatch.setattr(code_mod, "PROJECTS_DIR", tmp_path)
+        r = code_mod.CreateCodeTool().run({"filename": "../evil.py", "code": "pass\n"})
+        assert r.ok  # basename only -> stays in projects dir
+        assert (tmp_path / "evil.py").exists()
+
+
+class TestSentenceStreamer:
+    def test_sentences_emitted_incrementally(self):
+        from app.voice.session import _SentenceStreamer
+        out = []
+        s = _SentenceStreamer(out.append)
+        s.feed("Saved the file. It")
+        assert out == ["Saved the file."]
+        s.feed(" has two parts.")
+        assert out == ["Saved the file."]  # no trailing boundary yet
+        s.flush()
+        assert out == ["Saved the file.", "It has two parts."]
+
+    def test_flush_speaks_remainder(self):
+        from app.voice.session import _SentenceStreamer
+        out = []
+        s = _SentenceStreamer(out.append)
+        s.feed("All done")
+        s.flush()
+        assert out == ["All done"]
+
+
+class TestNewIntents:
+    def test_good_morning_is_daily_brief(self):
+        from app.assistant.intents import match
+        assert match("good morning")[0] == "daily_brief"
+
+    def test_volume_relative(self):
+        from app.assistant.intents import match
+        import json
+        assert json.loads(match("volume up")[1])["action"] == "up"
+        d = json.loads(match("turn it down by 20")[1])
+        assert d["action"] == "down" and d["level"] == 20
+
+    def test_code_request_reaches_create_code_file(self):
+        from app.assistant.intents import tool_subset_for
+        s = tool_subset_for("make a snake game in python")
+        assert "create_code_file" in s and "write_file" in s
+
+
+class TestSTTFilters:
+    def test_decoder_loop_rejected(self):
+        from app.voice.stt import _is_hallucination, _keep_segment
+        junk = "we will use this link to find all of this link " * 12
+        assert _is_hallucination(junk)
+        assert not _keep_segment({"no_speech_prob": 0.1, "avg_logprob": -0.3,
+                                  "compression_ratio": 8.0, "text": junk})
+        assert _keep_segment({"no_speech_prob": 0.1, "avg_logprob": -0.3,
+                              "compression_ratio": 1.4, "text": "set a timer"})

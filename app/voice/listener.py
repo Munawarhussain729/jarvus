@@ -21,6 +21,9 @@ log = logging.getLogger("jarvus.voice.listener")
 
 DEFAULT_WAKE_WORDS = ["jarvis", "jarvus", "hey jarvis", "hey jarvus"]
 DEFAULT_STOP_PHRASES = ["go to sleep", "stop listening", "ok go to sleep"]
+# Below this RMS (float32 audio) a chunk is effectively silence - skip the
+# whisper inference entirely instead of paying GPU time for a hallucination.
+DEFAULT_SILENCE_RMS = 0.003
 
 try:
     import speech_recognition as sr
@@ -39,6 +42,9 @@ class VoiceListener:
         use_wake_word: bool = False,
         stt_engine: str = "auto",
         stt_model: str = "turbo",
+        stt_no_speech_threshold: float = 0.6,
+        stt_min_logprob: float = -1.0,
+        silence_rms: float = DEFAULT_SILENCE_RMS,
     ):
         self.wake_words = [w.lower() for w in (wake_words or DEFAULT_WAKE_WORDS)]
         self.stop_phrases = [p.lower() for p in (stop_phrases or DEFAULT_STOP_PHRASES)]
@@ -55,8 +61,12 @@ class VoiceListener:
         self._stt = stt  # lazily resolved via get_stt(engine, model)
         self._stt_engine = stt_engine
         self._stt_model = stt_model
+        self._stt_no_speech = stt_no_speech_threshold
+        self._stt_min_logprob = stt_min_logprob
+        self._silence_rms = silence_rms
         self._one_shot: queue.Queue[str] | None = None
         self._one_shot_lock = threading.Lock()
+        self.last_stt_ms = 0  # last transcribe() wall time, for turn_timing logs
         self._thread: Optional[threading.Thread] = None
         self._worker: Optional[threading.Thread] = None
 
@@ -69,19 +79,22 @@ class VoiceListener:
 
     def _engine(self) -> SpeechToText:
         if self._stt is None:
-            self._stt = get_stt(self._stt_engine, self._stt_model)
+            self._stt = get_stt(
+                self._stt_engine, self._stt_model,
+                no_speech_threshold=self._stt_no_speech,
+                min_logprob=self._stt_min_logprob,
+            )
         return self._stt
-
-    # Below this RMS (float32 audio) a chunk is effectively silence - skip the
-    # whisper inference entirely instead of paying GPU time for a hallucination.
-    _SILENCE_RMS = 0.003
 
     def _transcribe(self, audio) -> str:
         raw = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
         arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        if not arr.size or float(np.sqrt(np.mean(arr * arr))) < self._SILENCE_RMS:
+        if not arr.size or float(np.sqrt(np.mean(arr * arr))) < self._silence_rms:
             return ""
-        return self._engine().transcribe(arr)
+        t0 = time.monotonic()
+        text = self._engine().transcribe(arr)
+        self.last_stt_ms = int((time.monotonic() - t0) * 1000)
+        return text
 
     def _contains_wake_word(self, text: str) -> bool:
         return any(w in text for w in self.wake_words)

@@ -143,6 +143,9 @@ def match(text: str) -> Optional[tuple[str, str]]:
         return "read_notifications", "{}"
 
     # Daily digest / task analysis - deterministic, no LLM round trip.
+    # 'good morning' doubles as the daily-routine macro: digest + schedule.
+    if re.match(r"^good (?:morning|afternoon|evening)\b[.!]?$", t):
+        return "daily_brief", "{}"
     if re.search(r"\b(?:brief|briefing|analy[sz]e|review|plan)\b.*\b(?:my\s+)?(?:day|tasks?|schedule)\b", t) or \
        re.search(r"\b(?:what'?s on|what do i have|my)\s+(?:today|schedule|agenda|day)\b", t) or \
        re.search(r"\bhow'?s my day\b", t):
@@ -317,6 +320,13 @@ def match(text: str) -> Optional[tuple[str, str]]:
     m = re.match(r"^(?:set\s+)?volume(?:\s+to)?\s+(\d{1,3})\s*%?$", t)
     if m:
         return "volume", json.dumps({"action": "set", "level": int(m.group(1))})
+    m = re.match(r"^(?:turn|volume|make it)\s+(?:the\s+|it\s+)?(?:up|down|louder|quieter|softer)(?:\s+(?:by\s+)?(\d{1,2}))?\s*%?$", t)
+    if m and re.search(r"\b(?:volume|up|down|louder|quieter|softer)\b", t):
+        direction = "down" if re.search(r"\b(?:down|quieter|softer)\b", t) else "up"
+        args = {"action": direction}
+        if m.group(1):
+            args["level"] = int(m.group(1))
+        return "volume", json.dumps(args)
     if re.match(r"^mute\b", t):
         return "volume", json.dumps({"action": "mute"})
     if re.match(r"^unmute\b", t):
@@ -349,8 +359,8 @@ _ALWAYS_TOOLS = frozenset({
 _TOOL_GROUPS: list[tuple[re.Pattern, frozenset[str]]] = [
     (re.compile(r"\bfiles?\b|\bfolders?\b|\bdirector(?:y|ies)\b|\bdocuments?\b|\bfind\b|\blocate\b|\bspotlight\b|\.(?:txt|md|py|csv|json|docx)\b"),
      {"read_file", "write_file", "list_dir", "glob_files", "find_files", "create_docx"}),
-    (re.compile(r"\b(?:terminal|shell|command|cmd|script|execut|python|code|process(?:es)?|kill|compile|build)\b"),
-     {"run_command", "shell_read", "python_exec", "safe_shell", "ps_list"}),
+    (re.compile(r"\b(?:terminal|shell|command|cmd|script|execut|python|code|process(?:es)?|kill|compile|build|games?|programs?)\b"),
+     {"run_command", "shell_read", "python_exec", "safe_shell", "ps_list", "create_code_file", "write_file"}),
     (re.compile(r"\b(?:app|application|open|launch|quit|close|front|active window|shortcut)\b"),
      {"open_app", "frontmost_app", "open_url", "run_shortcut"}),
     (re.compile(r"\bnotifications?\b|\bbanner\b"),

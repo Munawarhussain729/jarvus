@@ -19,7 +19,7 @@ CAPABILITIES (call tools with valid arguments only):
 - open_app / open_url / say / volume / send_notification / read_notifications / screenshot / clipboard / frontmost_app: macOS control & notifications
 - dark_mode / lock_screen / sleep_display / run_shortcut / empty_trash: more macOS control
 - read_file / write_file / list_dir / glob_files / find_files: file operations & Spotlight search (sandboxed)
-- run_command (HIGH risk) / shell_read / python_exec: execution
+- run_command (HIGH risk) / shell_read / python_exec / create_code_file: execution & writing programs/games to ~/Jarvus/projects
 - plan / todo_write: planning & persistent task list (set/add/complete/list)
 - system_info / ps_list / clock / date_calc / battery / network_info: system, time & date, network
 - weather / timer / alarm / reminder / calendar: everyday tasks
@@ -37,6 +37,7 @@ PRINCIPLES:
 - Keep replies SHORT and spoken-friendly (this is often a voice interface).
 - Voice input may be imperfect. If the request seems garbled, ask a one-line clarifying question instead of guessing.
 - NEVER pick a tool just because its name sounds similar - 'scratchpad' is the user's notes file, 'read_notifications' reads system notifications, 'send_notification' only SENDS a banner.
+- 'Make / write / create' a program, game, or script means call create_code_file with the filename and full code - it saves to ~/Jarvus/projects and syntax-checks in one call.
 - If no tool fits the request, say what you can't do in one short sentence and ask a clarifying question.
 - Use 'remember' proactively when the user shares personal facts, preferences, or context.
 - HIGH risk tools require user confirmation - mention it briefly if cancelled.
@@ -91,7 +92,9 @@ class JarvusAgent(AssistantSession):
                 prefix = content.split("]", 1)[0] + "]" if content.startswith("[tool") else ""
                 self._messages[i]["content"] = f"{prefix} (earlier output elided)".strip()
 
-    def process_user_text(self, text: str) -> str:
+    def process_user_text(self, text: str, *, on_delta=None) -> str:
+        """on_delta: optional callback receiving reply text chunks as they
+        stream (voice mode uses it to speak the first sentence early)."""
         from app.security.sanitize import sanitize_user_message, InputRejected
 
         try:
@@ -131,6 +134,7 @@ class JarvusAgent(AssistantSession):
         system_prompt = self._prompt_with_facts()  # once per turn, not per round
         nudged = False
         rounds = 0
+        tool_ms = 0
         t0 = time.monotonic()
         logged = False
         while rounds < self._max_tool_rounds:
@@ -143,6 +147,7 @@ class JarvusAgent(AssistantSession):
                 system_prompt=system_prompt,
                 messages=self._messages,
                 tools=tools,
+                on_delta=on_delta,
             )
             if not logged:
                 logged = True
@@ -165,27 +170,44 @@ class JarvusAgent(AssistantSession):
                     ],
                 })
                 for tc in turn.tool_calls:
+                    tt = time.monotonic()
                     body = self._router.handle_tool_call(tool_name=tc.name, arguments_json=tc.arguments_json)
+                    tool_ms += int((time.monotonic() - tt) * 1000)
                     if len(body) > MAX_TOOL_RESULT_CHARS:
                         body = body[:MAX_TOOL_RESULT_CHARS] + "\n... (truncated)"
                     self._messages.append({"role": "tool", "tool_call_id": tc.id, "content": body})
                 self._trim_context()
                 continue
-            reply = (turn.content or "").strip() or "(no text)"
-            # Small local models sometimes promise an action instead of calling
-            # the tool. Nudge once so the call actually happens.
-            if not nudged and _looks_like_unfulfilled_action(reply):
+            reply = (turn.content or "").strip()
+            # Small local models sometimes return empty content or promise an
+            # action instead of calling the tool. Nudge once so the turn
+            # actually produces something; for action verbs the nudge names
+            # the candidate tools so round 2 lands the call.
+            if not nudged and (not reply or _looks_like_unfulfilled_action(reply)):
                 nudged = True
-                self._messages.append({"role": "assistant", "content": reply})
-                self._messages.append({
-                    "role": "user",
-                    "content": "Call the appropriate tool now - do not just describe the action.",
-                })
+                if reply:
+                    self._messages.append({"role": "assistant", "content": reply})
+                nudge = "Call the appropriate tool now, or give a short spoken reply - never respond with empty text."
+                if _ACTION_RE.search(cleaned):
+                    names = [t["function"]["name"] for t in tools][:10]
+                    nudge = (f"That request needs a tool call - emit one of [{', '.join(names)}] "
+                             "with valid JSON arguments right now, not a description.")
+                self._messages.append({"role": "user", "content": nudge})
                 continue
+            if not reply:
+                log.warning("llm_turn produced empty content")
+                reply = "Sorry, I didn't catch that - could you say it again?"
+            log.info("turn_done rounds=%d tool_ms=%d wall_ms=%d",
+                     rounds, tool_ms, int((time.monotonic() - t0) * 1000))
             self._memory.append_message("assistant", reply)
             self._messages.append({"role": "assistant", "content": reply})
             return reply
         return "[Jarvus] Max rounds exceeded"
+
+
+_ACTION_RE = re.compile(
+    r"\b(make|write|create|build|open|launch|set|send|play|start|stop|turn|"
+    r"delete|remind|add|run|schedule|generate|code|take|capture)\b", re.IGNORECASE)
 
 
 _PROMISE_PATTERNS = ("let me ", "i'll ", "i will ", "i can help you", "i can check",

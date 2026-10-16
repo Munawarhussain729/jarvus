@@ -22,6 +22,7 @@ class OpenAIProvider(ModelProvider):
         system_prompt: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        on_delta=None,
     ) -> AssistantTurn:
         api_messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         api_messages.extend(messages)

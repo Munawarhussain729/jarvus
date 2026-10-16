@@ -11,7 +11,7 @@ from app.models.base import ModelProvider
 from app.models.local_provider import LocalProvider
 from app.models.openai_provider import OpenAIProvider
 from app.tools.clock import ClockTool
-from app.tools.code import PythonExecTool
+from app.tools.code import CreateCodeTool, PythonExecTool
 from app.tools.docx import CreateDocxTool
 from app.tools.filesystem import GlobTool, ListDirTool, ReadFileTool, WriteFileTool
 from app.tools.internet import CryptoTool, CurrencyTool, JokeTool, NetworkInfoTool, NewsTool, StockTool, WikipediaTool
@@ -53,6 +53,7 @@ def build_registry(memory: EnhancedMemory) -> ToolRegistry:
         PlanTool(memory),
         TodoWriteTool(memory),
         PythonExecTool(),
+        CreateCodeTool(),
         RunCommandTool(),
         OpenAppTool(),
         SayTool(),
@@ -120,6 +121,7 @@ def build_provider(
         max_tokens=settings.max_tokens,
         num_ctx=settings.llm_num_ctx,
         think=settings.llm_think,
+        keep_alive=settings.llm_keep_alive,
     )
 
 
