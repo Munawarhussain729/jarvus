@@ -31,7 +31,10 @@ class Settings(BaseSettings):
 
     # Local LLM (Ollama native API preferred; any OpenAI-compatible base URL works)
     llm_base_url: str = Field(default="http://localhost:11434")
-    llm_model: str = Field(default="qwen3:4b-instruct-2507-q4_K_M")  # instruct (non-thinking) - fast tool use
+    # gpt-oss:20b MoE (~3.6B active params, ~13GB MXFP4) is the largest model that
+    # runs fluidly on a 16GB M1 alongside STT+TTS. Lighter fallback:
+    # JARVUS_LLM_MODEL=qwen3:14b or qwen3:4b-instruct-2507-q4_K_M
+    llm_model: str = Field(default="gpt-oss:20b")
     llm_num_ctx: int = Field(default=8192)  # fits 16GB Macs; raise via JARVUS_PROFILE=coding
     llm_think: bool = Field(default=False)  # qwen3-style thinking; off for voice latency
     llm_keep_alive: str = Field(default="30m")  # Ollama model residency; lower frees RAM sooner
@@ -47,11 +50,19 @@ class Settings(BaseSettings):
     tts_voice: str = Field(default="af_heart")  # kokoro voice id or macOS voice name
     tts_rate: int = Field(default=200)  # 'say' words-per-minute
     wake_words: str = Field(default="jarvis,jarvus,hey jarvis,hey jarvus")
+    # Exact-match phrases that interrupt TTS playback mid-speech (barge-in)
+    interrupt_phrases: str = Field(
+        default="stop,stop it,cancel,be quiet,quiet,enough,shut up,never mind,shush")
 
     # Daily briefing: auto = voice sessions only, on = text too, off = never
     auto_brief: str = Field(default="auto")
     # Heuristic tool-payload prefilter (off = always send all schemas)
     tool_prefilter: bool = Field(default=True)
+    # Background fact extraction after each turn - Jarvus personalises over time
+    auto_learn: bool = Field(default=True)
+    # Devin project registry seed: "name=/abs/path,other=/abs/path2"
+    # (memory-stored registrations override entries with the same name)
+    devin_projects: str = Field(default="")
     # Named preset for context/generation/memory budgets: lean | balanced | coding.
     # Individual JARVUS_* vars always win over the profile.
     profile: str = Field(default="balanced")
@@ -64,6 +75,21 @@ class Settings(BaseSettings):
     @property
     def wake_word_list(self) -> list[str]:
         return [w.strip().lower() for w in self.wake_words.split(",") if w.strip()]
+
+    @property
+    def interrupt_phrase_list(self) -> list[str]:
+        return [p.strip().lower() for p in self.interrupt_phrases.split(",") if p.strip()]
+
+    @property
+    def devin_project_map(self) -> dict[str, str]:
+        """Parse 'name=/path,name2=/path2' into {name: path}."""
+        out: dict[str, str] = {}
+        for pair in self.devin_projects.split(","):
+            if "=" in pair:
+                name, path = pair.split("=", 1)
+                if name.strip() and path.strip():
+                    out[name.strip().lower().replace(" ", "-")] = path.strip()
+        return out
 
     @field_validator("data_dir", mode="before")
     @classmethod

@@ -111,6 +111,7 @@ def _run_voice(settings, agent, *, wake_word: bool, speak: bool, auto_brief: boo
     tts = get_tts(engine=settings.tts_engine, voice=settings.tts_voice, rate=settings.tts_rate)
     listener = VoiceListener(
         wake_words=settings.wake_word_list,
+        interrupt_phrases=settings.interrupt_phrase_list,
         use_wake_word=wake_word,
         stt_engine=settings.stt_engine,
         stt_model=settings.stt_model,
@@ -124,8 +125,19 @@ def _run_voice(settings, agent, *, wake_word: bool, speak: bool, auto_brief: boo
     if router is not None:
         router.set_confirmer(voice.voice_confirmer)
 
+    def _stdin_watcher() -> None:
+        # Enter key interrupts speech - works even when the mic can't hear
+        # the user over loud playback.
+        while True:
+            if sys.stdin.readline() == "":  # EOF: stdin closed or not a tty
+                return
+            voice.interrupt_speech()
+
+    if sys.stdin is not None and sys.stdin.isatty():
+        threading.Thread(target=_stdin_watcher, daemon=True).start()
+
     print("\nVoice mode" + (" (wake word: " + ", ".join(settings.wake_word_list) + ")" if wake_word else " (continuous)"))
-    print("Say 'go to sleep' to stop. Ctrl-C to exit.\n")
+    print("Say 'stop' or press Enter to interrupt speech. Say 'go to sleep' to stop. Ctrl-C to exit.\n")
     voice.start()
     try:
         while True:

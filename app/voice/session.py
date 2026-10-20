@@ -113,6 +113,8 @@ class _SpeechPipeline:
         self._san = _StreamSanitizer()
 
     def _enqueue(self, text: str) -> None:
+        if self._session._interrupt.is_set():
+            return  # user barged in - drop speech still streaming from the LLM
         sent = clean_for_speech(text)
         if not sent or sent in self._seen:
             return
@@ -159,6 +161,10 @@ class JarvusVoice:
         self.auto_brief = auto_brief
         self.processing = threading.Event()
         self.listener.callback = self.handle_voice
+        self.listener.on_interrupt = self.interrupt_speech
+        # Set by interrupt_speech (barge-in / Enter key): kills current
+        # playback and suppresses queued + still-streaming speech this turn.
+        self._interrupt = threading.Event()
         self._speech_q: queue.Queue[str] = queue.Queue(maxsize=_SpeechPipeline.MAX_QUEUE)
         self._speaker_stop = threading.Event()
         self._speaker_thread: threading.Thread | None = None
@@ -170,6 +176,9 @@ class JarvusVoice:
             try:
                 text = self._speech_q.get(timeout=0.2)
             except queue.Empty:
+                continue
+            if self._interrupt.is_set():
+                self._speech_q.task_done()
                 continue
             self.listener.paused.set()
             self.listener.state = "speaking"
@@ -192,16 +201,32 @@ class JarvusVoice:
         if not clean:
             return
         self.listener.paused.set()
+        prev_state = self.listener.state
+        self.listener.state = "speaking"
         try:
             self.tts.speak(clean)
             time.sleep(0.35)  # let room echo of the tail decay before re-arming the mic
         finally:
+            self.listener.state = prev_state
             self.listener.paused.clear()
+
+    def interrupt_speech(self) -> None:
+        """Barge-in (voice 'stop' or Enter key): kill current playback, drop
+        queued sentences, and suppress speech still streaming from the LLM."""
+        self._interrupt.set()
+        self.tts.stop()
+        while True:
+            try:
+                self._speech_q.get_nowait()
+            except queue.Empty:
+                break
+            self._speech_q.task_done()
 
     def handle_voice(self, text: str) -> None:
         if self.processing.is_set():
             return
         self.processing.set()
+        self._interrupt.clear()  # new turn: any prior barge-in is spent
         self.listener.state = "processing"
         try:
             if not text:
@@ -276,10 +301,12 @@ class JarvusVoice:
 
     def stop(self) -> None:
         self._speaker_stop.set()
+        self.interrupt_speech()  # also kill any in-flight TTS playback
         if self._speaker_thread:
             self._speaker_thread.join(timeout=2)
 
     def start(self) -> None:
+        self._interrupt.clear()
         self._ensure_speaker()
         self.speak("Jarvus is online.")
         if self.auto_brief:

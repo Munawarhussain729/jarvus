@@ -470,14 +470,19 @@ class _FakeListener:
         import threading
         self.paused = threading.Event()
         self.state = "idle"
+        self.on_interrupt = None
 
 
 class _FakeTTS:
     def __init__(self):
         self.spoken: list[str] = []
+        self.stopped = 0
 
     def speak(self, text):
         self.spoken.append(text)
+
+    def stop(self):
+        self.stopped += 1
 
 
 def _make_session():
@@ -486,6 +491,7 @@ def _make_session():
     v.tts = _FakeTTS()
     v.listener = _FakeListener()
     import queue, threading
+    v._interrupt = threading.Event()
     v._speech_q = queue.Queue(maxsize=8)
     v._speaker_stop = threading.Event()
     v._speaker_thread = None
@@ -559,6 +565,148 @@ class TestSpeechPipeline:
         sess._speech_q.join()
         assert sess.tts.spoken == ["File saved."]
         sess._speaker_stop.set()
+
+
+class TestInterrupt:
+    def _listener_stub(self, transcript):
+        from app.voice.listener import VoiceListener
+        li = VoiceListener.__new__(VoiceListener)
+        li.wake_words = ["jarvis", "jarvus", "hey jarvis", "hey jarvus"]
+        li.stop_phrases = ["go to sleep"]
+        li.interrupt_phrases = ["stop", "be quiet", "enough"]
+        li.should_stop = False
+        li.calls = []
+        li.on_interrupt = lambda: li.calls.append(1)
+        li._transcribe = lambda audio: transcript
+        return li
+
+    def test_barge_in_stop_fires_interrupt(self):
+        li = self._listener_stub("Stop.")
+        li._check_barge_in(object())
+        assert li.calls == [1]
+
+    def test_barge_in_wake_word_prefix_fires(self):
+        li = self._listener_stub("Hey Jarvis, stop.")
+        li._check_barge_in(object())
+        assert li.calls == [1]
+
+    def test_barge_in_echo_sentence_does_not_fire(self):
+        # Exact match only - Jarvis echo transcribed mid-word 'stop' inside a
+        # longer sentence must not cut playback.
+        li = self._listener_stub("The next bus stop is two blocks away.")
+        li._check_barge_in(object())
+        assert li.calls == []
+
+    def test_barge_in_wake_word_alone_does_not_fire(self):
+        li = self._listener_stub("Jarvis.")
+        li._check_barge_in(object())
+        assert li.calls == []
+
+    def test_barge_in_stop_phrase_stops_listener(self):
+        li = self._listener_stub("Go to sleep.")
+        li._check_barge_in(object())
+        assert li.should_stop and li.calls == []
+
+    def test_interrupt_speech_kills_tts_and_drains_queue(self):
+        sess = _make_session()
+        sess._speech_q.put("one.")
+        sess._speech_q.put("two.")
+        sess.interrupt_speech()
+        assert sess.tts.stopped == 1
+        assert sess._speech_q.empty()
+        sess._speaker_stop.set()
+
+    def test_pipeline_drops_speech_after_interrupt(self):
+        from app.voice.session import _SpeechPipeline
+        sess = _make_session()
+        sess.interrupt_speech()
+        p = _SpeechPipeline(sess)
+        p.feed("This should never be spoken. ")
+        p.finish()
+        sess._speech_q.join()
+        assert sess.tts.spoken == []
+        sess._speaker_stop.set()
+
+
+class TestDevinTools:
+    def _mem(self, tmp_path):
+        from app.memory.enhanced import EnhancedMemory
+        return EnhancedMemory(tmp_path / "m.db")
+
+    def test_register_list_remove_project(self, tmp_path):
+        from app.tools.devin import DevinProjectTool, DevinProjectsTool
+        mem = self._mem(tmp_path)
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        r = DevinProjectTool(mem).run({"name": "My Proj", "path": str(proj)})
+        assert r.ok and "my-proj" in r.payload
+        listed = DevinProjectsTool(mem).run({})
+        assert "my-proj" in listed.payload and str(proj) in listed.payload
+        r = DevinProjectTool(mem).run({"name": "my-proj", "remove": True})
+        assert r.ok
+        assert "my-proj" not in DevinProjectsTool(mem).run({}).payload
+
+    def test_register_rejects_bad_path(self, tmp_path):
+        from app.tools.devin import DevinProjectTool
+        r = DevinProjectTool(self._mem(tmp_path)).run(
+            {"name": "x", "path": str(tmp_path / "nope")})
+        assert not r.ok
+
+    def test_devin_cmd_construction(self):
+        from app.tools.devin import _devin_cmd
+        c = _devin_cmd(cloud=False, session=None, continue_last=False,
+                       permission_mode="smart", prompt="fix it",
+                       prompt_file=None, headless=True)
+        assert c == ["devin", "--permission-mode", "smart", "-p", "fix it",
+                     "--respect-workspace-trust", "false"]
+        c = _devin_cmd(cloud=True, session="devin-abc", continue_last=False,
+                       permission_mode=None, prompt="hi",
+                       prompt_file=None, headless=True)
+        assert c == ["devin", "--cloud", "-r", "devin-abc", "-p", "hi",
+                     "--respect-workspace-trust", "false"]
+        c = _devin_cmd(cloud=False, session=None, continue_last=True,
+                       permission_mode=None, prompt=None,
+                       prompt_file="/tmp/p.txt", headless=False)
+        assert c == ["devin", "-c", "--prompt-file", "/tmp/p.txt"]
+
+    def test_send_unknown_project_errors(self, tmp_path):
+        from app.tools.devin import DevinSendTool
+        r = DevinSendTool(self._mem(tmp_path)).run(
+            {"project": "ghost", "prompt": "hi"})
+        assert not r.ok and "unknown project" in r.payload
+
+
+class TestAutoLearn:
+    def test_parse_fact_candidates(self):
+        from app.assistant.agent import parse_fact_candidates
+        assert parse_fact_candidates('[]') == []
+        assert parse_fact_candidates(
+            'Here you go [{"key":"Editor","value":"prefers vim"}]') \
+            == [("editor", "prefers vim")]
+        # secrets never stored
+        assert parse_fact_candidates(
+            '[{"key":"api_key","value":"sk-123"},{"key":"city","value":"Berlin"}]'
+        ) == [("city", "Berlin")]
+        # garbage -> nothing
+        assert parse_fact_candidates("not json at all") == []
+        # caps at max_facts
+        many = "[" + ",".join(f'{{"key":"k{i}","value":"v{i}"}}' for i in range(6)) + "]"
+        assert len(parse_fact_candidates(many)) == 3
+
+    def test_learn_from_turn_writes_facts(self, tmp_path):
+        from app.assistant.agent import JarvusAgent
+        from app.memory.enhanced import EnhancedMemory
+
+        class _P:
+            def generate(self, **_):
+                from app.models.base import AssistantTurn
+                return AssistantTurn(content='[{"key":"city","value":"Berlin"}]')
+
+        a = JarvusAgent.__new__(JarvusAgent)
+        a._memory = EnhancedMemory(tmp_path / "m.db")
+        a._provider = _P()
+        a._learn_from_turn("I live in Berlin", "Noted.")
+        assert a._memory.get_fact("city") == "Berlin"
 
 
 class TestVAD:

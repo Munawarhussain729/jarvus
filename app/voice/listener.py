@@ -2,13 +2,16 @@
 
 Runs 100% local STT. The capture loop never stops draining the audio buffer;
 while `paused` is set (i.e. during TTS playback) audio is discarded so Jarvus
-cannot hear and re-trigger itself. Commands are dispatched on a worker thread
-so the stream keeps draining during processing and playback.
+cannot hear and re-trigger itself - except while `state == "speaking"`, where
+chunks are still transcribed and matched against `interrupt_phrases` so the
+user can barge in ("stop", "jarvis stop", ...). Commands are dispatched on a
+worker thread so the stream keeps draining during processing and playback.
 """
 from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -21,6 +24,13 @@ log = logging.getLogger("jarvus.voice.listener")
 
 DEFAULT_WAKE_WORDS = ["jarvis", "jarvus", "hey jarvis", "hey jarvus"]
 DEFAULT_STOP_PHRASES = ["go to sleep", "stop listening", "ok go to sleep"]
+# Exact-match barge-in phrases heard during TTS playback. Exact match (after
+# normalization + wake-word strip) so echo of Jarvus's own sentences - which
+# transcribe to longer strings - can't self-interrupt.
+DEFAULT_INTERRUPT_PHRASES = [
+    "stop", "stop it", "cancel", "be quiet", "quiet", "enough",
+    "shut up", "never mind", "nevermind", "shush",
+]
 # Below this RMS (float32 audio) a chunk is effectively silence - skip the
 # whisper inference entirely instead of paying GPU time for a hallucination.
 DEFAULT_SILENCE_RMS = 0.003
@@ -38,7 +48,9 @@ class VoiceListener:
         stt: SpeechToText | None = None,
         wake_words: Optional[list[str]] = None,
         stop_phrases: Optional[list[str]] = None,
+        interrupt_phrases: Optional[list[str]] = None,
         callback: Optional[Callable[[str], None]] = None,
+        on_interrupt: Optional[Callable[[], None]] = None,
         use_wake_word: bool = False,
         stt_engine: str = "auto",
         stt_model: str = "turbo",
@@ -48,7 +60,11 @@ class VoiceListener:
     ):
         self.wake_words = [w.lower() for w in (wake_words or DEFAULT_WAKE_WORDS)]
         self.stop_phrases = [p.lower() for p in (stop_phrases or DEFAULT_STOP_PHRASES)]
+        self.interrupt_phrases = [p.lower() for p in (interrupt_phrases or DEFAULT_INTERRUPT_PHRASES)]
         self.callback = callback
+        # Called (on the capture thread) when an interrupt phrase is heard
+        # during TTS playback - the session hooks this to kill speech output.
+        self.on_interrupt = on_interrupt
         self.use_wake_word = use_wake_word
         self.listening = False
         self.should_stop = False
@@ -111,6 +127,35 @@ class VoiceListener:
                 return text[idx + len(w):].strip(" ,.!?")
         return text
 
+    def _check_barge_in(self, audio) -> None:
+        """While TTS plays, transcribe drained chunks for an interrupt phrase.
+
+        Only exact matches (after stripping punctuation and any wake word)
+        trigger, so a transcribed echo of Jarvus's own playback - normally a
+        longer sentence - won't cut its own speech short.
+        """
+        try:
+            text = self._transcribe(audio)
+        except Exception as e:
+            log.debug("barge-in transcribe error: %s", e)
+            return
+        if not text:
+            return
+        log.debug("Heard during playback: %s", text)
+        norm = re.sub(r"[^a-z ]", " ", text.lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if any(sp in norm for sp in self.stop_phrases):
+            log.info("Stop phrase detected during playback")
+            self.stop()
+            return
+        cmd = norm
+        for w in sorted(self.wake_words, key=len, reverse=True):
+            cmd = re.sub(rf"\b{re.escape(w)}\b", " ", cmd)
+        cmd = re.sub(r"\s+", " ", cmd).strip()
+        if cmd and cmd in self.interrupt_phrases and self.on_interrupt is not None:
+            log.info("Barge-in interrupt: %r", text)
+            self.on_interrupt()
+
     def _dispatch(self, text: str) -> None:
         if self.callback is None:
             return
@@ -146,6 +191,10 @@ class VoiceListener:
                     continue
 
                 if self.paused.is_set():
+                    # While speaking, still scan the drained audio for an
+                    # interrupt phrase so the user can cut playback short.
+                    if self.state == "speaking":
+                        self._check_barge_in(audio)
                     continue  # drain + discard: prevents TTS echo / buffer buildup
 
                 with self._one_shot_lock:
