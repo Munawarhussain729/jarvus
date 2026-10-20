@@ -361,6 +361,8 @@ _TOOL_GROUPS: list[tuple[re.Pattern, frozenset[str]]] = [
      {"read_file", "write_file", "list_dir", "glob_files", "find_files", "create_docx"}),
     (re.compile(r"\b(?:terminal|shell|command|cmd|script|execut|python|code|process(?:es)?|kill|compile|build|games?|programs?)\b"),
      {"run_command", "shell_read", "python_exec", "safe_shell", "ps_list", "create_code_file", "write_file"}),
+    (re.compile(r"\bdevins?\b|\bagent sessions?\b|\bprojects?\b"),
+     {"devin_send", "devin_projects", "devin_project", "run_command"}),
     (re.compile(r"\b(?:app|application|open|launch|quit|close|front|active window|shortcut)\b"),
      {"open_app", "frontmost_app", "open_url", "run_shortcut"}),
     (re.compile(r"\bnotifications?\b|\bbanner\b"),

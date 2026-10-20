@@ -1,8 +1,10 @@
 """Full agent with extended capabilities."""
 from __future__ import annotations
 
+import json
 import logging
 import re
+import threading
 import time
 from typing import Any
 
@@ -30,6 +32,7 @@ CAPABILITIES (call tools with valid arguments only):
 - random / text_tools: coin flips, dice, passwords, uuid, base64/hash/case transforms
 - scratchpad: the user's own notes file (NOT system notifications)
 - remember / recall / forget: long-term memory of user facts
+- devin_projects / devin_project / devin_send: list & register Devin projects, and send prompts to Devin sessions (local CLI or cloud)
 
 PRINCIPLES:
 - CRITICAL: when the user asks you to DO something a tool covers, you MUST emit the tool call in this turn. Never reply with 'let me', 'I will', 'I can' or describe the action without calling the tool.
@@ -58,12 +61,72 @@ _CODE_REQUEST_RE = re.compile(
 
 log = logging.getLogger("jarvus.agent")
 
+# Background auto-learning: after each turn a small extraction pass pulls
+# durable user facts into the facts table, so Jarvus personalises over time
+# without the user saying "remember this".
+_LEARN_SYSTEM_PROMPT = """You maintain a fact store about the user of a personal assistant.
+From the exchange below, extract ONLY durable facts about the user worth
+remembering across sessions: name, preferences, projects they work on, habits,
+tools/settings they stated.
+Rules:
+- Output ONLY a JSON array like [{"key":"editor","value":"prefers vim"}] or [] when nothing durable exists.
+- At most 3 facts. Keys are short snake_case slugs; values are one short phrase.
+- Never store passwords, tokens, API keys, one-off requests, or assistant-internal details.
+- Questions, commands, and small talk usually yield []."""
+
+
+def parse_fact_candidates(text: str, max_facts: int = 3) -> list[tuple[str, str]]:
+    """Parse the extractor's JSON array into (key, value) pairs, defensively."""
+    m = re.search(r"\[.*\]", text or "", re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[tuple[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        key = re.sub(r"[^a-z0-9_.-]", "_", str(item.get("key", "")).lower().strip())[:40].strip("_.-")
+        value = str(item.get("value", "")).strip()[:300]
+        if not key or not value:
+            continue
+        # Never persist anything that looks like a credential.
+        if any(s in key for s in ("password", "token", "secret", "api_key", "apikey")):
+            continue
+        out.append((key, value))
+        if len(out) >= max_facts:
+            break
+    return out
+
 
 class JarvusAgent(AssistantSession):
-    def __init__(self, *args, tool_prefilter: bool = True, **kwargs) -> None:
+    def __init__(self, *args, tool_prefilter: bool = True, auto_learn: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._system_prompt = AGENT_SYSTEM_PROMPT
         self._tool_prefilter = tool_prefilter
+        self._auto_learn = auto_learn
+
+    def _learn_from_turn(self, user_text: str, reply: str) -> None:
+        """Background pass: pull durable user facts out of the exchange."""
+        if not isinstance(self._memory, EnhancedMemory):
+            return
+        try:
+            turn = self._provider.generate(
+                system_prompt=_LEARN_SYSTEM_PROMPT,
+                messages=[{"role": "user",
+                           "content": f"User: {user_text}\nAssistant: {reply}"}],
+                tools=None,
+                max_tokens=200,
+            )
+            for key, value in parse_fact_candidates(turn.content or ""):
+                self._memory.set_fact(key, value)
+                log.info("auto-learned fact: %s", key)
+        except Exception as e:
+            log.debug("auto-learn extraction failed: %s", e)
 
     def _prompt_with_facts(self) -> str:
         if isinstance(self._memory, EnhancedMemory):
@@ -250,6 +313,11 @@ class JarvusAgent(AssistantSession):
                 pass
             self._memory.append_message("assistant", reply)
             self._messages.append({"role": "assistant", "content": reply})
+            if self._auto_learn:
+                # Off the critical path: extraction runs while the reply is
+                # already being spoken/printed. Never blocks the turn.
+                threading.Thread(target=self._learn_from_turn,
+                                 args=(cleaned, reply), daemon=True).start()
             return reply
         return "[Jarvus] Max rounds exceeded"
 

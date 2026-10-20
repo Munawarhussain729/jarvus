@@ -24,6 +24,7 @@ from app.tools.music import MusicTool
 from app.tools.notes import NoteTool
 from app.tools.notifications import NotificationsTool
 from app.tools.briefing import DailyBriefTool
+from app.tools.devin import DevinProjectTool, DevinProjectsTool, DevinSendTool
 from app.tools.plan import PlanTool, TodoWriteTool
 from app.tools.registry import EchoTool, ToolRegistry
 from app.tools.reminders import CalendarReadTool, CalendarTool, ListRemindersTool, ReminderTool
@@ -101,6 +102,9 @@ def build_registry(memory: EnhancedMemory) -> ToolRegistry:
         RememberTool(memory),
         RecallTool(memory),
         ForgetTool(memory),
+        DevinProjectTool(memory),
+        DevinProjectsTool(memory),
+        DevinSendTool(memory),
     ])
 
 
@@ -125,6 +129,23 @@ def build_provider(
     )
 
 
+def _seed_devin_projects(memory: EnhancedMemory, settings: Settings) -> None:
+    """Merge JARVUS_DEVIN_PROJECTS entries into the stored registry (memory
+    wins for names already registered so env edits don't clobber updates)."""
+    seed = settings.devin_project_map
+    if not seed:
+        return
+    from app.tools.devin import _load_registry, _save_registry
+    reg = _load_registry(memory)
+    changed = False
+    for name, path in seed.items():
+        if name not in reg:
+            reg[name] = {"path": path, "cloud": False}
+            changed = True
+    if changed:
+        _save_registry(memory, reg)
+
+
 def build_agent(
     settings: Settings,
     *,
@@ -134,10 +155,12 @@ def build_agent(
     confirmer: Confirmer | None = None,
 ) -> tuple[JarvusAgent, MemoryStore]:
     memory = EnhancedMemory(settings.resolved_db_path())
+    _seed_devin_projects(memory, settings)
     registry = build_registry(memory)
     audit = AuditLogger(memory)
     router = ToolRouter(registry, audit, confirmer=confirmer)
     provider = build_provider(settings, use_openai=use_openai, model=model, base_url=base_url)
     agent = JarvusAgent(provider=provider, registry=registry, router=router, memory=memory,
-                        tool_prefilter=settings.tool_prefilter)
+                        tool_prefilter=settings.tool_prefilter,
+                        auto_learn=settings.auto_learn)
     return agent, memory
