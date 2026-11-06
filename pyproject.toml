@@ -7,6 +7,8 @@ name = "jarvus"
 version = "0.1.0"
 description = "Local-first, security-minded personal assistant for macOS"
 readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Munawar Hussain" }]
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.40.0",
@@ -31,6 +33,10 @@ voice = [
     "mlx-whisper>=0.4; sys_platform=='darwin' and platform_machine=='arm64'",
     "mlx-audio>=0.5; sys_platform=='darwin' and platform_machine=='arm64'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Munawarhussain729/jarvus"
+Issues = "https://github.com/Munawarhussain729/jarvus/issues"
 
 [project.scripts]
 jarvus = "app.main:main"
