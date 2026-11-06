@@ -75,3 +75,98 @@ def test_router_high_risk_denied_without_yes(tmp_path: Path) -> None:
         out = router.handle_tool_call(tool_name="safe_shell", arguments_json=args)
     assert "cancelled" in out.lower() or "denied" in out.lower()
     store.close()
+
+
+# ---- release-hardening regressions -------------------------------------------------
+# subprocess.run is replaced by a recorder in every shell test, so none of these
+# commands can ever actually execute, whatever the code under test does.
+
+from app.tools import shell_extended  # noqa: E402
+from app.tools.filesystem import ReadFileTool, _validate_path  # noqa: E402
+from app.tools.shell_extended import ShellReadOnlyTool  # noqa: E402
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+        class _P:
+            stdout = "ok"
+            stderr = ""
+            returncode = 0
+
+        return _P()
+
+
+@pytest.fixture
+def recorder(monkeypatch) -> _Recorder:
+    rec = _Recorder()
+    monkeypatch.setattr(shell_extended.subprocess, "run", rec)
+    return rec
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ls; rm -rf x",
+        "echo pwned",
+        "cat $(echo /etc/passwd)",
+        "python3 -c print(1)",
+        "python3 script.py",
+        "node -e 1",
+        "git config --get user.email",
+        "git -c core.pager=sh log",
+        "find . -exec echo hi ;",
+        "find . -delete",
+        "cat ~/.ssh/id_rsa",
+        "head -n 5 ~/.aws/credentials",
+    ],
+)
+def test_shell_read_rejects_unsafe_commands(cmd: str, recorder: _Recorder) -> None:
+    r = ShellReadOnlyTool().run({"command": cmd})
+    assert r.ok is False, cmd
+    assert recorder.calls == [], f"command reached subprocess: {cmd}"
+
+
+@pytest.mark.parametrize("cmd", ["ls && echo pwned", "ls | cat", "ls ; touch x"])
+def test_shell_operators_are_literal_arguments_not_chained(cmd: str, recorder: _Recorder) -> None:
+    ShellReadOnlyTool().run({"command": cmd})
+    for args, kwargs in recorder.calls:
+        assert kwargs.get("shell") is False
+        assert args[0][0] == "ls"  # a single ls process; operators are inert arguments
+
+
+def test_shell_read_never_uses_a_shell(recorder: _Recorder) -> None:
+    r = ShellReadOnlyTool().run({"command": "pwd"})
+    assert r.ok is True
+    (args, kwargs), = recorder.calls
+    assert kwargs.get("shell") is False
+    assert args[0] == ["pwd"]
+
+
+def test_shell_read_allows_version_checks(recorder: _Recorder) -> None:
+    assert ShellReadOnlyTool().run({"command": "python3 --version"}).ok is True
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [".ssh/id_rsa", ".aws/credentials", ".gnupg/pubring.kbx", ".netrc", "project/.env", "project/.env.local",
+     "Library/Keychains/login.keychain-db"],
+)
+def test_file_sandbox_blocks_credential_paths(rel: str) -> None:
+    with pytest.raises(ValueError, match="protected"):
+        _validate_path(str(Path.home() / rel))
+
+
+def test_file_sandbox_still_allows_normal_home_files() -> None:
+    assert _validate_path(str(Path.home() / "Documents" / "notes.txt")).name == "notes.txt"
+
+
+def test_read_file_tool_refuses_env_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVUS_FS_ROOTS", str(tmp_path))
+    env = tmp_path / ".env"
+    env.write_text("SECRET=1")
+    assert ReadFileTool().run({"path": str(env)}).ok is False

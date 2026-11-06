@@ -20,6 +20,39 @@ def _allowed_roots() -> list[Path]:
     return roots
 
 
+# Credential stores and secrets that must never be reachable through the file
+# tools, even though they live under the (allowed) home directory.
+_DENIED_HOME_SUBPATHS = (
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".azure",
+    ".config/gh",
+    ".config/gcloud",
+    ".docker/config.json",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    "Library/Keychains",
+    "Library/Cookies",
+    "Library/Application Support/Google/Chrome",
+    "Library/Safari",
+)
+
+
+def _is_denied(path: Path) -> bool:
+    if path.name == ".env" or path.name.startswith(".env."):
+        return True
+    home = Path.home().resolve()
+    for sub in _DENIED_HOME_SUBPATHS:
+        denied = (home / sub).resolve()
+        if path == denied or path.is_relative_to(denied):
+            return True
+    return False
+
+
 def _validate_path(p: str, *, field: str = "path") -> Path:
     try:
         # sanitize
@@ -29,6 +62,8 @@ def _validate_path(p: str, *, field: str = "path") -> Path:
     path = Path(p).expanduser().resolve()
     if not any(path == r or path.is_relative_to(r) for r in _allowed_roots()):
         raise ValueError(f"Path outside allowed sandbox: {path}")
+    if _is_denied(path):
+        raise ValueError(f"Path is protected (credentials/secrets): {path}")
     return path
 
 

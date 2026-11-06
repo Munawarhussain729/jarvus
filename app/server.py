@@ -9,6 +9,7 @@ Bind defaults to localhost; use --host 0.0.0.0 only behind a firewall/VPN (Tails
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import threading
@@ -38,7 +39,8 @@ def make_handler(agent, token: str | None):
         def _auth_ok(self) -> bool:
             if not token:
                 return True
-            return self.headers.get("Authorization", "") == f"Bearer {token}"
+            supplied = self.headers.get("Authorization", "")
+            return hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode())
 
         def _send(self, code: int, body: dict[str, Any]) -> None:
             data = json.dumps(body).encode()
