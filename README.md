@@ -2,11 +2,13 @@
 
 Local-first, security-minded personal assistant — JARVIS-style voice control, 100% local inference. Optimized for Apple Silicon, portable to a private server.
 
+> **Status: hobby project, macOS / Apple Silicon.** Jarvus can run commands, write files and control apps on your Mac when you approve them, so read the [Security model](#security-model) before using it. It is not affiliated with Ollama, OpenAI, or any model vendor. No warranty (see [LICENSE](LICENSE)).
+
 ## Stack (all local)
 
 | Layer | Default | Fallback / options |
 |---|---|---|
-| **LLM** | Ollama, `qwen3:8b` (native API, thinking off) | any Ollama model; any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM); OpenAI via `--openai` |
+| **LLM** | Ollama, `gpt-oss:20b` by default (set `JARVUS_LLM_MODEL`; native API, thinking off) | any Ollama model; any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM); OpenAI via `--openai` |
 | **STT** | mlx-whisper `large-v3-turbo` (GPU on Apple Silicon) | faster-whisper (`JARVUS_STT_ENGINE=faster-whisper`), smaller models via `JARVUS_STT_MODEL` |
 | **TTS** | Kokoro-82M via mlx-audio (`af_heart`) | macOS `say` (`JARVUS_TTS_ENGINE=say`) |
 | **Memory** | SQLite (`~/.jarvus/jarvus.db`): chats, audit, long-term facts | — |
@@ -42,7 +44,8 @@ pip install -e ".[voice,dev]"
 
 brew install espeak-ng        # phonemizer for Kokoro
 brew services start ollama    # local LLM server, auto-starts at login
-ollama pull qwen3:8b          # or qwen3:4b for lower latency
+ollama pull gpt-oss:20b       # default; for less RAM/latency: ollama pull qwen3:4b-instruct-2507-q4_K_M
+                              # and set JARVUS_LLM_MODEL to it (see .env.example)
 ```
 
 ## Run
@@ -78,7 +81,10 @@ Everything is env-driven (`JARVUS_*`, see `.env.example`): LLM URL/model/ctx/thi
 
 - Tools are an explicit allowlist; model text is never executed.
 - HIGH risk (run_command, python_exec, write_file, open_app, message, email, web_fetch, safe_shell) requires confirmation — typed or spoken.
-- File tools are sandboxed to `$HOME`, `/tmp`, and `JARVUS_FS_ROOTS`.
+- File tools are sandboxed to `$HOME`, `/tmp`, and `JARVUS_FS_ROOTS`, and always refuse credential locations (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser data, `.env` files, …).
+- `shell_read` runs a small read-only command set without a shell (no pipes, chaining or substitution); file arguments go through the same sandbox.
+- Treat everything the model reads from the web or files as untrusted: a malicious page could try to steer the assistant. Confirmations are your last line of defence — read what you approve.
+- If you run the HTTP server beyond localhost, set `JARVUS_SERVER_TOKEN` and keep it behind a firewall/VPN. `"confirm": true` on a request pre-approves HIGH-risk tools.
 - Every tool call is audit-logged with args and outcome.
 
 ## Tests
